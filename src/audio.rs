@@ -1,4 +1,7 @@
-use crate::dsp::{self, Detector, Frame};
+use crate::{
+    dsp::{self, Detector, Frame},
+    piano::{self, Piano},
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{traits::*, HeapRb};
 use std::{
@@ -181,7 +184,7 @@ pub fn route() -> &'static str {
     if is_wsl() {
         "Windows direct · SoundPlayer helper"
     } else {
-        "Native audio · CPAL sine oscillator"
+        "Native audio · CPAL piano"
     }
 }
 struct Windows {
@@ -291,16 +294,12 @@ fn write_wave(
     once: bool,
 ) -> std::result::Result<(), String> {
     let rate = 48000u32;
-    let cycles = (freq * 2.0).round();
-    let len = if once {
-        if second.is_some() {
-            76800
-        } else {
-            48000
-        }
+    let samples = if once {
+        render_example(freq, second, rate)
     } else {
-        (rate as f32 * cycles / freq).round() as u32
+        piano::range_loop(freq, rate)
     };
+    let len = samples.len() as u32;
     let bytes = len * 2;
     let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut data = Vec::with_capacity(bytes as usize + 44);
@@ -316,41 +315,20 @@ fn write_wave(
     data.extend(16u16.to_le_bytes());
     data.extend(b"data");
     data.extend(bytes.to_le_bytes());
-    if once {
-        for sample in render_example(freq, second, rate) {
-            data.extend(((sample * 32767.0) as i16).to_le_bytes());
-        }
-    } else {
-        for i in 0..len {
-            let x = (std::f32::consts::TAU * cycles * i as f32 / len as f32).sin() * 0.15;
-            data.extend(((x * 32767.0) as i16).to_le_bytes());
-        }
+    for sample in samples {
+        data.extend(((sample * 32767.0) as i16).to_le_bytes());
     }
     file.write_all(&data).map_err(|e| e.to_string())
 }
 /// Prepared example PCM, shared by Windows playback and reference analysis.
 pub fn render_example(first: f32, second: Option<f32>, rate: u32) -> Vec<f32> {
-    let len = (rate as f32 * if second.is_some() { 1.6 } else { 1.0 }) as usize;
-    let (mut phase, mut current) = (0.0f32, first);
-    (0..len)
-        .map(|i| {
-            let target = if i as f32 >= rate as f32 * 0.8 {
-                second.unwrap_or(first)
-            } else {
-                first
-            };
-            current += (target - current) / (rate as f32 * 0.01);
-            phase = (phase + std::f32::consts::TAU * current / rate as f32) % std::f32::consts::TAU;
-            let envelope = (i as f32 / (rate as f32 * 0.005))
-                .min((len - 1 - i) as f32 / (rate as f32 * 0.005))
-                .min(1.0);
-            phase.sin() * 0.15 * envelope
-        })
-        .collect()
+    piano::example(first, second, rate)
 }
+
 struct Native {
     _stream: cpal::Stream,
     frequency: Arc<AtomicU32>,
+    strike: Arc<AtomicU32>,
     enabled: Arc<AtomicBool>,
     observed: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
@@ -363,7 +341,6 @@ impl Native {
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        let rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
         let frequency = Arc::new(AtomicU32::new(130.81f32.to_bits()));
         let freq = frequency.clone();
@@ -373,28 +350,28 @@ impl Native {
         let error = failed.clone();
         let observed = Arc::new(AtomicBool::new(false));
         let ready = observed.clone();
-        let (mut phase, mut amp, mut current) = (0.0f32, 0.0f32, 130.81f32);
+        let strike = Arc::new(AtomicU32::new(0));
+        let strikes = strike.clone();
+        let mut piano = Piano::new(config.sample_rate.0);
+        let (mut last_strike, mut was_active) = (0u32, false);
         macro_rules! stream {
             ($t:ty,$convert:expr) => {
                 device
                     .build_output_stream(
                         &config,
                         move |output: &mut [$t], _| {
-                            if active.load(Ordering::Relaxed) {
+                            let enabled = active.load(Ordering::Relaxed);
+                            let epoch = strikes.load(Ordering::Acquire);
+                            if enabled && (!was_active || epoch != last_strike) {
+                                piano.strike(f32::from_bits(freq.load(Ordering::Relaxed)));
+                                last_strike = epoch;
                                 ready.store(true, Ordering::Relaxed);
+                            } else if !enabled && was_active {
+                                piano.stop();
                             }
+                            was_active = enabled;
                             for frame in output.chunks_exact_mut(channels) {
-                                let goal = if active.load(Ordering::Relaxed) {
-                                    0.15
-                                } else {
-                                    0.0
-                                };
-                                amp += (goal - amp) * (1.0 / (rate * 0.005));
-                                current += (f32::from_bits(freq.load(Ordering::Relaxed)) - current)
-                                    * (1.0 / (rate * 0.01));
-                                phase = (phase + std::f32::consts::TAU * current / rate)
-                                    % std::f32::consts::TAU;
-                                let sample = phase.sin() * amp;
+                                let sample = piano.sample();
                                 for v in frame {
                                     *v = ($convert)(sample);
                                 }
@@ -418,6 +395,7 @@ impl Native {
         Ok(Self {
             _stream: stream,
             frequency,
+            strike,
             enabled,
             observed,
             failed,
@@ -472,6 +450,7 @@ impl Player {
                 n.frequency
                     .store(dsp::hz(note as f32).to_bits(), Ordering::Relaxed);
                 n.observed.store(false, Ordering::Relaxed);
+                n.strike.fetch_add(1, Ordering::Release);
                 n.enabled.store(true, Ordering::Relaxed);
             }
             Backend::Windows(w) => w.play(note, second, once)?,
@@ -537,12 +516,12 @@ mod tests {
     #[test]
     fn examples_have_envelopes_and_connected_correct_pitches() {
         let pcm = render_example(dsp::hz(48.0), Some(dsp::hz(55.0)), 12000);
-        assert_eq!(pcm.len(), 19200);
+        assert_eq!(pcm.len(), 48000);
         assert_eq!(pcm[0], 0.0);
         assert_eq!(*pcm.last().unwrap(), 0.0);
-        assert!(pcm.windows(2).all(|w| (w[1] - w[0]).abs() < 0.02));
+        assert!(pcm.windows(2).all(|w| (w[1] - w[0]).abs() < 0.08));
         let mut detector = Detector::new();
-        for (start, note) in [(2400, 48), (14400, 55)] {
+        for (start, note) in [(2400, 48), (28800, 55)] {
             let f = detector.analyze(&pcm[start..start + 600], 12000.0, 0.0, false);
             assert!(dsp::cents(f.hz.unwrap(), note).abs() < 5.0);
         }
@@ -567,6 +546,6 @@ mod tests {
             .collect();
         assert!(samples.iter().any(|v| v.abs() > 0.14));
         assert!(samples[0].abs() < 0.001);
-        assert!((samples[0] - samples.last().unwrap()).abs() < 0.004);
+        assert!((samples[0] - samples.last().unwrap()).abs() < 0.02);
     }
 }

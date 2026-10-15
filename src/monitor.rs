@@ -121,6 +121,32 @@ pub fn pinned_pitch(clips: &[&[Frame]], end: f64) -> VecDeque<Frame> {
     }
     output
 }
+/// Fit every saved guide into the map, preserving clip order and breaks.
+/// This overview scales reference time only; microphone evidence stays live.
+pub fn overview_pitch(clips: &[&[Frame]], end: f64) -> VecDeque<Frame> {
+    let mut output = VecDeque::new();
+    let slot = 3.0 / clips.len().max(1) as f64;
+    for (index, clip) in clips.iter().enumerate() {
+        let start = clip.first().map_or(0.0, |f| f.time);
+        let duration = clip.last().map_or(0.05, |f| f.time - start + 0.05);
+        let offset = end - 3.0 + index as f64 * slot;
+        for f in *clip {
+            let mut copy = f.clone();
+            copy.time = offset + (f.time - start) / duration * slot * 0.92;
+            copy.spectrum = None;
+            output.push_back(copy);
+        }
+        output.push_back(Frame {
+            time: offset + slot * 0.96,
+            hz: None,
+            confidence: 0.0,
+            rms: 0.0,
+            clipped: false,
+            spectrum: None,
+        });
+    }
+    output
+}
 pub fn spectral_color(db: f32, gain: f32) -> Color32 {
     let level = if db <= -120.0 {
         0.0
@@ -141,12 +167,25 @@ pub fn spectral_color(db: f32, gain: f32) -> Color32 {
         std::array::from_fn(|c| (stops[i][c] * (1.0 - f) + stops[i + 1][c] * f) as u8);
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
+#[derive(Clone, Copy)]
+pub struct PitchTarget {
+    pub note: i32,
+    pub tolerance_cents: f32,
+}
+impl From<i32> for PitchTarget {
+    fn from(note: i32) -> Self {
+        Self {
+            note,
+            tolerance_cents: 15.0,
+        }
+    }
+}
 /// A semitone axis keeps equal musical intervals equally spaced.
 pub fn pitch_monitor(
     ui: &mut egui::Ui,
     trace: &VecDeque<Frame>,
     examples: &VecDeque<Frame>,
-    target: Option<i32>,
+    target: Option<PitchTarget>,
     full_scale: bool,
     height: f32,
     end: f64,
@@ -159,7 +198,10 @@ pub fn pitch_monitor(
         .filter(|frame| frame.confidence >= 0.85 && !frame.clipped)
         .find_map(|frame| frame.hz.and_then(valid_midi));
     let show_target = target.is_some();
-    let target = target.unwrap_or_else(|| voice_note.map_or(60, |note| note.round() as i32));
+    let tolerance = target.map_or(0.15, |t| t.tolerance_cents / 100.0);
+    let target = target
+        .map(|t| t.note)
+        .unwrap_or_else(|| voice_note.map_or(60, |note| note.round() as i32));
     let mut notes: Vec<i32> = (target - 2..=target + 2).collect();
     if let Some(note) = voice_note {
         let voice = note.round() as i32;
@@ -341,8 +383,8 @@ pub fn pitch_monitor(
     }
     if show_target {
         let band = egui::Rect::from_min_max(
-            egui::pos2(plot.left(), y(target as f32 + 0.15)),
-            egui::pos2(plot.right(), y(target as f32 - 0.15)),
+            egui::pos2(plot.left(), y(target as f32 + tolerance)),
+            egui::pos2(plot.right(), y(target as f32 - tolerance)),
         );
         painter.rect_filled(
             band,
@@ -564,6 +606,27 @@ mod tests {
         }
     }
     #[test]
+    fn full_overview_keeps_every_guide_in_view_with_breaks() {
+        let clips: Vec<Vec<Frame>> = (36..=84)
+            .map(|note| vec![frame(0.0, note), frame(1.0, note)])
+            .collect();
+        let refs: Vec<_> = clips.iter().map(Vec::as_slice).collect();
+        let overview = overview_pitch(&refs, 100.0);
+        assert!(overview.iter().all(|f| (97.0..=100.0).contains(&f.time)));
+        assert!(overview
+            .iter()
+            .zip(overview.iter().skip(1))
+            .all(|(a, b)| a.time <= b.time));
+        assert_eq!(overview.iter().filter(|f| f.hz.is_some()).count(), 98);
+        assert_eq!(overview.iter().filter(|f| f.hz.is_none()).count(), 49);
+        for note in 36..=84 {
+            assert!(overview.iter().any(|f| f
+                .hz
+                .is_some_and(|hz| (dsp::midi(hz) - note as f32).abs() < 0.01)));
+        }
+        assert!(overview_pitch(&[], 100.0).is_empty());
+    }
+    #[test]
     fn pinned_guides_keep_source_times_and_break_between_clips() {
         let first: Vec<_> = (0..96).map(|i| frame(i as f64 * 0.01, 48)).collect();
         let second: Vec<_> = (0..96).map(|i| frame(i as f64 * 0.01, 50)).collect();
@@ -614,7 +677,15 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    pitch_monitor(ui, &trace, &VecDeque::new(), Some(48), false, 240.0, 1.0)
+                    pitch_monitor(
+                        ui,
+                        &trace,
+                        &VecDeque::new(),
+                        Some(48.into()),
+                        false,
+                        240.0,
+                        1.0,
+                    )
                 });
             },
         );
@@ -629,5 +700,54 @@ mod tests {
         assert!(labels.contains(&"Target · C3"));
         assert!(labels.contains(&"C5"));
         assert!(labels.iter().any(|s| s.contains("st")));
+    }
+}
+
+#[cfg(test)]
+mod tolerance_tests {
+    use super::*;
+    #[test]
+    fn target_band_reflects_the_selected_range_tolerance() {
+        let band_height = |tolerance_cents| {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720.0, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        pitch_monitor(
+                            ui,
+                            &VecDeque::new(),
+                            &VecDeque::new(),
+                            Some(PitchTarget {
+                                note: 48,
+                                tolerance_cents,
+                            }),
+                            false,
+                            240.0,
+                            0.0,
+                        )
+                    });
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Rect(r)
+                        if r.fill == Color32::from_rgba_unmultiplied(100, 230, 150, 35) =>
+                    {
+                        Some(r.rect.height())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!((band_height(75.0) / band_height(15.0) - 5.0).abs() < 0.01);
     }
 }

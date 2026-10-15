@@ -2,7 +2,7 @@ use crate::monitor::{View, BLUE, GREEN, PURPLE};
 use crate::{
     audio::{self, Capture, Player},
     dsp::{self, Frame},
-    training::{self, Config, Exercise, Mode, Range, RangePhase, Result, Segmenter},
+    training::{self, Config, Exercise, Mode, Range, RangeEvent, RangePhase, Result, Segmenter},
 };
 use eframe::egui::{self, Color32, Pos2, RichText, Stroke, Vec2};
 use std::{
@@ -34,6 +34,101 @@ struct Guide {
     frames: Vec<Frame>,
     pending: Option<std::sync::mpsc::Receiver<Vec<Frame>>>,
 }
+#[derive(Clone, Copy)]
+enum InstructionIcon {
+    Up,
+    Down,
+    Hold,
+    Listen,
+    Breathe,
+    Done,
+}
+
+/// Reusable presentation for a short coaching instruction, independent of
+/// range detection so drills can supply their own cues later.
+struct InstructionCard<'a> {
+    icon: InstructionIcon,
+    title: &'a str,
+    detail: &'a str,
+    color: Color32,
+}
+impl InstructionCard<'_> {
+    fn show(&self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 60.0), egui::Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 8.0, Color32::from_rgb(24, 38, 49));
+        p.rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(1.0_f32, self.color),
+            egui::StrokeKind::Inside,
+        );
+        let point = |x: f32, y: f32| rect.min + Vec2::new(6.0 + x * 0.7, 15.0 + y * 0.7);
+        let stroke = Stroke::new(2.5_f32, self.color);
+        match self.icon {
+            InstructionIcon::Up | InstructionIcon::Down => {
+                let (tip, tail, wing) = if matches!(self.icon, InstructionIcon::Up) {
+                    (6.0, 36.0, 18.0)
+                } else {
+                    (36.0, 6.0, 24.0)
+                };
+                p.line_segment([point(21.0, tail), point(21.0, tip)], stroke);
+                p.line_segment([point(9.0, wing), point(21.0, tip)], stroke);
+                p.line_segment([point(33.0, wing), point(21.0, tip)], stroke);
+            }
+            InstructionIcon::Hold => {
+                for y in [16.0, 27.0] {
+                    p.line_segment([point(7.0, y), point(35.0, y)], stroke);
+                }
+            }
+            InstructionIcon::Listen => {
+                p.circle_filled(point(15.0, 31.0), 6.0, self.color);
+                p.line_segment([point(20.0, 31.0), point(20.0, 8.0)], stroke);
+                p.line_segment([point(20.0, 8.0), point(32.0, 12.0)], stroke);
+            }
+            InstructionIcon::Breathe => {
+                let points = (0..=24)
+                    .map(|i| {
+                        let x = i as f32 / 24.0;
+                        point(
+                            5.0 + x * 32.0,
+                            21.0 - (x * std::f32::consts::TAU).sin() * 8.0,
+                        )
+                    })
+                    .collect();
+                p.add(egui::Shape::line(points, stroke));
+            }
+            InstructionIcon::Done => {
+                p.line_segment([point(7.0, 22.0), point(17.0, 32.0)], stroke);
+                p.line_segment([point(17.0, 32.0), point(36.0, 10.0)], stroke);
+            }
+        }
+        let text = p.with_clip_rect(rect.shrink(5.0));
+        text.text(
+            Pos2::new(rect.left() + 44.0, rect.top() + 6.0),
+            egui::Align2::LEFT_TOP,
+            self.title,
+            egui::FontId::proportional(18.0),
+            self.color,
+        );
+        let detail = text.layout(
+            self.detail.to_owned(),
+            egui::FontId::proportional(11.0),
+            Color32::from_gray(195),
+            rect.width() - 50.0,
+        );
+        text.galley(
+            Pos2::new(rect.left() + 44.0, rect.top() + 29.0),
+            detail,
+            Color32::from_gray(195),
+        );
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, self.title));
+        response.on_hover_text(self.detail)
+    }
+}
+
 pub struct Coach {
     epoch: Instant,
     capture: Option<Capture>,
@@ -58,7 +153,12 @@ pub struct Coach {
     sequence_start: usize,
     example: Option<Example>,
     range: Option<Range>,
+    range_reference_ready_at: Option<f64>,
+    range_input_after: f64,
+    range_resume_at: Option<f64>,
+    range_descending: bool,
     accepted: Option<(i32, i32, i32)>,
+    accepted_sustain: Option<(i32, f64)>,
     capture_seen: f64,
     spectrum_secs: f32,
     spectrum_low: f32,
@@ -102,7 +202,12 @@ impl Coach {
             sequence_start: 0,
             example: None,
             range: None,
+            range_reference_ready_at: None,
+            range_input_after: 0.0,
+            range_resume_at: None,
+            range_descending: false,
             accepted: None,
+            accepted_sustain: None,
             capture_seen: 0.0,
             spectrum_secs: 1.0,
             spectrum_low: 65.0,
@@ -173,7 +278,7 @@ impl Coach {
         self.segmenter.clear();
         if self.capture.is_some() {
             self.workflow = Workflow::Cooldown {
-                until: self.now() + 0.5,
+                until: self.now() + 1.0,
             };
         } else {
             self.workflow = Workflow::Stopped;
@@ -254,32 +359,76 @@ impl Coach {
         self.guide = None;
     }
     fn start_range(&mut self) {
+        let tail = if self.player.playing { 0.5 } else { 0.0 };
         self.sequence_start = self.guides.len();
         self.guide = None;
         self.stop_reference();
         self.segmenter.clear();
-        let note = self.accepted.map(|r| r.2).unwrap_or(48);
-        self.range = Some(Range::new(note));
-        self.range_reference();
+        self.range_reference_ready_at = None;
+        self.range_input_after = self.now() + tail;
+        self.range_resume_at = None;
+        self.range_descending = false;
+        self.range = Some(Range::new());
     }
     fn range_reference(&mut self) {
         self.segmenter.clear();
+        self.range_resume_at = None;
+        self.range_reference_ready_at = None;
         if let Some(r) = &mut self.range {
             r.reset_hold();
-            let n = r.target;
-            self.add_guide(n, None);
-            if let Err(e) = self.player.play(n) {
-                self.error = Some(e);
-                self.player.stop();
+            if let Some(note) = r.target {
+                self.add_guide(note, None);
+                if let Err(e) = self.player.play(note) {
+                    self.error = Some(e);
+                    self.player.stop();
+                } else {
+                    self.error = None;
+                }
             } else {
-                self.error = None;
+                let tail = if self.player.playing { 0.5 } else { 0.0 };
+                self.player.stop();
+                self.range_input_after = self.now() + tail;
             }
         }
     }
+    fn observe_range_frame(&mut self, f: &Frame) {
+        if self.range_resume_at.is_some() || f.time < self.range_input_after {
+            return;
+        }
+        let ready = self.player.playing
+            && self.player.ready
+            && self.range_reference_ready_at.is_some_and(|t| f.time >= t);
+        if let Some(range) = &mut self.range {
+            let event = range.observe_guided(f, ready, self.range_reference_ready_at);
+            self.range_event(event);
+        }
+    }
+    fn range_event(&mut self, event: RangeEvent) {
+        match event {
+            RangeEvent::None => {}
+            RangeEvent::ReferenceChanged => {
+                let descending = self
+                    .range
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.phase, RangePhase::Lower | RangePhase::LowerEdge));
+                if descending && !self.range_descending {
+                    self.range_descending = true;
+                    self.player.stop();
+                    self.range_reference_ready_at = None;
+                    self.range_resume_at = Some(self.now() + 2.0);
+                } else {
+                    self.range_reference();
+                }
+            }
+            RangeEvent::Complete => self.finish_range(),
+        }
+    }
     fn finish_range(&mut self) {
+        self.range_resume_at = None;
         if let Some(r) = self.range.take() {
             if let Some(result) = r.recommendation() {
                 self.accepted = Some(result);
+                self.accepted_sustain = r.highest_sustain;
                 self.config.target = result.2;
             } else {
                 self.error =
@@ -310,6 +459,22 @@ impl Coach {
             };
         }
         let now = self.now();
+        if self.range.is_none() {
+            self.range_resume_at = None;
+        }
+        if self.range_resume_at.is_some_and(|until| now >= until) {
+            self.range_reference();
+        }
+        if !self.player.playing || !self.player.ready {
+            self.range_reference_ready_at = None;
+        }
+        if self.range.is_some()
+            && self.player.playing
+            && self.player.ready
+            && self.range_reference_ready_at.is_none()
+        {
+            self.range_reference_ready_at = Some(now);
+        }
         if self
             .capture
             .as_ref()
@@ -341,25 +506,7 @@ impl Coach {
                 self.history.pop_front();
             }
             if self.range.is_some() {
-                let changed = self
-                    .range
-                    .as_mut()
-                    .unwrap()
-                    .observe(&f, self.player.playing && self.player.ready);
-                if changed {
-                    let r = self.range.as_ref().unwrap();
-                    let bound = (r.phase == RangePhase::Higher && r.matched.contains(&84))
-                        || (r.phase == RangePhase::Lower && r.matched.contains(&36));
-                    if bound {
-                        if self.range.as_mut().unwrap().limit() {
-                            self.finish_range();
-                        } else {
-                            self.range_reference();
-                        }
-                    } else {
-                        self.range_reference();
-                    }
-                }
+                self.observe_range_frame(&f);
                 continue;
             }
             match &mut self.workflow {
@@ -398,6 +545,22 @@ impl Coach {
                 _ => {}
             }
         }
+        if let Some(range) = &mut self.range {
+            let event = range.advance(now);
+            let resting = range.resting(now);
+            if resting {
+                self.player.stop();
+            }
+            self.range_event(event);
+        }
+        // Process queued matches first so a successful final attempt wins
+        // over the unanswered-prompt timeout. Each new target resets readiness.
+        if self.range_resume_at.is_none() && self.player.playing && self.player.ready {
+            if let (Some(range), Some(start)) = (&mut self.range, self.range_reference_ready_at) {
+                let event = range.reference_elapsed(now - start, now, true);
+                self.range_event(event);
+            }
+        }
         if self.example.is_some() && self.player.ready {
             let example = self.example.as_mut().unwrap();
             let start = *example.started.get_or_insert(now);
@@ -420,7 +583,7 @@ impl Coach {
             }
             if let Some(second) = example
                 .second
-                .filter(|_| example.stage == 0 && elapsed >= 0.8)
+                .filter(|_| example.stage == 0 && elapsed >= crate::piano::EXAMPLE_NOTE_SECONDS)
             {
                 example.stage = 1;
                 example.started = None;
@@ -432,15 +595,18 @@ impl Coach {
                     self.error = Some(e);
                     self.stop_reference();
                 }
-            } else if elapsed >= if example.stage == 1 { 0.8 } else { 1.0 } {
+            } else if elapsed >= crate::piano::EXAMPLE_NOTE_SECONDS {
                 self.stop_reference();
             }
         }
         if let Some(r) = &self.range {
-            if self.player.ready && self.player.playing {
+            if let Some(note) = r
+                .target
+                .filter(|_| self.player.ready && self.player.playing)
+            {
                 self.reference.push_back(Frame {
                     time: now,
-                    hz: Some(dsp::hz(r.target as f32)),
+                    hz: Some(dsp::hz(note as f32)),
                     confidence: 1.0,
                     rms: 0.106,
                     clipped: false,
@@ -459,7 +625,10 @@ impl Coach {
         if self.playback_only {
             return ("Playback diagnostic · microphone disabled", PURPLE);
         }
-        if self.range.is_some() {
+        if let Some(r) = &self.range {
+            if r.phase == RangePhase::Baseline {
+                return ("Range check · sing your starting note", GREEN);
+            }
             return if self.player.ready {
                 ("Range check · match the guide", GREEN)
             } else {
@@ -483,25 +652,131 @@ impl Coach {
             if old!=self.selected && self.capture.is_some(){self.capture=None;self.start_capture();if self.range.is_some(){self.range_reference();}}
             ui.horizontal(|ui|{if ui.button("Refresh devices").clicked(){self.devices=audio::inputs();}
  if ui.button("Use default").clicked(){self.selected=None;if self.capture.is_some(){self.capture=None;self.start_capture();}}});
-            ui.separator();ui.label("Reference output");ui.colored_label(PURPLE,audio::route());ui.small("Pure sine tone. Use headphones during range checking.");
+            ui.separator();ui.label("Reference output");ui.colored_label(PURPLE,audio::route());ui.small("Piano reference. Use headphones during range checking.");
             ui.separator();ui.label("Session data");ui.small("No voice recordings, accounts or network services. Charts retain up to 10 minutes; up to 24 reference guides. Everything clears when you close the app.");
         });
         self.settings = open;
     }
-    fn active_target(&self) -> i32 {
+    fn active_target(&self) -> Option<i32> {
         if let Some(range) = &self.range {
             return range.target;
         }
         if self.config.exercise == Exercise::Transition
             && (self.example.as_ref().is_some_and(|e| e.stage == 1)
-                || self
-                    .segmenter
-                    .started_at()
-                    .is_some_and(|t| self.latest.as_ref().is_some_and(|f| f.time - t >= 0.8)))
+                || self.segmenter.started_at().is_some_and(|t| {
+                    self.latest
+                        .as_ref()
+                        .is_some_and(|f| f.time - t >= crate::piano::EXAMPLE_NOTE_SECONDS)
+                }))
         {
-            self.config.target + self.config.interval
+            Some(self.config.target + self.config.interval)
         } else {
-            self.config.target
+            Some(self.config.target)
+        }
+    }
+    fn coaching_callout(&self, ui: &mut egui::Ui) {
+        let (icon, title, message, color) = if let Some(range) = &self.range {
+            let (icon, title) = match range.phase {
+                RangePhase::Baseline => (InstructionIcon::Hold, "Sing an easy note"),
+                RangePhase::ConfirmStart => (InstructionIcon::Hold, "Match this note"),
+                RangePhase::Higher | RangePhase::UpperEdge => (InstructionIcon::Up, "Go higher"),
+                RangePhase::Lower | RangePhase::LowerEdge => (InstructionIcon::Down, "Go lower"),
+                RangePhase::Complete => (InstructionIcon::Done, "Complete"),
+            };
+            let pace = range.pacing_cue(self.now(), self.range_reference_ready_at);
+            let (icon, title) = if self.range_resume_at.is_some() {
+                (InstructionIcon::Down, "Breathe · then lower")
+            } else {
+                match pace {
+                    Some("Listen to the piano") => (InstructionIcon::Listen, "Listen"),
+                    Some("Matched — finish gently") => (InstructionIcon::Hold, "Hold"),
+                    Some("Matched — take a breath") => (InstructionIcon::Breathe, "Breathe"),
+                    _ => (icon, title),
+                }
+            };
+            let direction = match range.phase {
+                RangePhase::Higher | RangePhase::UpperEdge => "Going up",
+                RangePhase::Lower | RangePhase::LowerEdge => "Going down",
+                _ => "Follow the piano",
+            };
+            let message = if let Some(note) = range.target {
+                if matches!(range.phase, RangePhase::Lower | RangePhase::LowerEdge) {
+                    let high = range
+                        .matched
+                        .iter()
+                        .max()
+                        .copied()
+                        .map(dsp::name)
+                        .unwrap_or_else(|| "—".into());
+                    format!("{direction} · {}\nHighest matched: {high}", dsp::name(note))
+                } else {
+                    format!("{direction} · {} · hold in green for 1s", dsp::name(note))
+                }
+            } else {
+                "Use an easy, relaxed ‘ah’.".into()
+            };
+            let message = if title == "Hold" {
+                format!(
+                    "{} · {:.1}s\nRelease when ready",
+                    range.target.map(dsp::name).unwrap_or_else(|| "—".into()),
+                    range.held_seconds()
+                )
+            } else {
+                message
+            };
+            (
+                icon,
+                title,
+                message,
+                if matches!(range.phase, RangePhase::Lower | RangePhase::LowerEdge) {
+                    PURPLE
+                } else {
+                    BLUE
+                },
+            )
+        } else if let Some((low, high, _)) = self.accepted {
+            (
+                InstructionIcon::Done,
+                "Complete",
+                format!(
+                    "Highest: {} → lowest: {}. Well done!{}",
+                    dsp::name(high),
+                    dsp::name(low),
+                    self.accepted_sustain
+                        .map(|(note, seconds)| format!(
+                            "\nHighest sustain: {} · {seconds:.1}s",
+                            dsp::name(note)
+                        ))
+                        .unwrap_or_default()
+                ),
+                GREEN,
+            )
+        } else {
+            let (icon, title) = match self.workflow {
+                Workflow::Reference => (InstructionIcon::Listen, "Listen"),
+                Workflow::Listening => (InstructionIcon::Hold, "Sing"),
+                Workflow::Cooldown { .. } | Workflow::AwaitQuiet { .. } => {
+                    (InstructionIcon::Breathe, "Breathe")
+                }
+                Workflow::Complete => (InstructionIcon::Done, "Review"),
+                Workflow::Stopped => (InstructionIcon::Hold, "Ready"),
+            };
+            (
+                icon,
+                title,
+                "Your next instruction appears here.".into(),
+                BLUE,
+            )
+        };
+        let response = InstructionCard {
+            icon,
+            title,
+            detail: &message,
+            color,
+        }
+        .show(ui);
+        if let Some(range) = &self.range {
+            response.on_hover_text(range.stage_message());
         }
     }
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -516,7 +791,33 @@ impl Coach {
         });
         ui.add_space(6.0);
         ui.separator();
-        ui.horizontal(|ui| {
+        {
+            let card_width = 280.0;
+            let gap = 12.0;
+            let controls_width = ui.available_width() - card_width - gap;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(controls_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(controls_width);
+                        self.header_controls(ui);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    Vec2::new(card_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(card_width);
+                        self.coaching_callout(ui);
+                    },
+                );
+            });
+        }
+    }
+    fn header_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
             let checking = self.range.is_some();
             let label = if checking {
                 "■ Stop range check"
@@ -548,12 +849,17 @@ impl Coach {
                 if let Some((low, high, start)) = self.accepted {
                     ui.colored_label(
                         BLUE,
-                        format!("Lowest: {} — Highest: {}", dsp::name(low), dsp::name(high)),
+                        format!("Highest: {} → Lowest: {}", dsp::name(high), dsp::name(low)),
                     );
+                    ui.small(format!("Estimate: {}", crate::range::range_estimate(low, high)))
+                        .on_hover_text("Rough range-only comparison, not a confirmed voice type. Based on your matched endpoints; comfortable range and tone are not assessed. Overlapping labels are alternatives, not multiple confirmed voice types.");
                     ui.small(format!("Exercise starting note: {}", dsp::name(start)));
+                    if let Some((note,seconds)) = self.accepted_sustain {
+                        ui.small(format!("Highest sustain: {} · {seconds:.1}s",dsp::name(note)));
+                    }
                 } else {
                     ui.label("Your range: not checked");
-                    ui.small("Lowest: — · Highest: —");
+                    ui.small("Highest: — · Lowest: —");
                 }
             });
             ui.separator();
@@ -590,6 +896,7 @@ impl Coach {
                     "Stopped"
                 },
             );
+
         });
         ui.horizontal_wrapped(|ui| {
             let live = self.latest.as_ref();
@@ -604,11 +911,15 @@ impl Coach {
                 .size(20.0)
                 .color(BLUE),
             );
-            let error = hz.map(|h| dsp::cents(h, self.active_target()));
+            let error = hz
+                .zip(self.active_target())
+                .map(|(h, note)| dsp::cents(h, note));
             if let Some(cents) = error {
                 ui.label(format!(
                     "{} · {cents:+.0} cents",
-                    if cents.abs() <= 15.0 {
+                    if self.range.is_some() && cents.abs() <= crate::range::MATCH_CENTS {
+                        "Close enough"
+                    } else if cents.abs() <= 15.0 {
                         "On target"
                     } else if cents > 0.0 {
                         "Above target"
@@ -641,56 +952,94 @@ impl Coach {
             self.range_ui(ui);
         }
     }
+
     fn range_ui(&mut self, ui: &mut egui::Ui) {
         let r = self.range.as_ref().unwrap();
         ui.horizontal_wrapped(|ui| {
-            ui.colored_label(BLUE, dsp::name(r.target));
-            let cue = if self.player.ready {
-                "Sing ‘ah’ and hold"
-            } else {
+            if let Some(note) = r.target {
+                ui.colored_label(BLUE, dsp::name(note));
+            }
+            let cue = if r.phase == RangePhase::Baseline {
+                "Sing an easy note"
+            } else if self.range_resume_at.is_some() {
+                "Take a breath"
+            } else if let Some(cue) = r.pacing_cue(self.now(), self.range_reference_ready_at) {
+                cue
+            } else if !self.player.ready {
                 "Reference not ready"
+            } else {
+                "Hold in green · 1s"
             };
             ui.add(
                 egui::ProgressBar::new(r.hold.min(1.0))
-                    .desired_width(140.0)
+                    .desired_width(160.0)
                     .text(cue),
             );
             ui.small(match r.phase {
-                RangePhase::Baseline => "Find an easy note",
+                RangePhase::Baseline => "Finding your starting note",
+                RangePhase::ConfirmStart => "Confirm your starting note",
                 RangePhase::Higher => "Exploring higher",
+                RangePhase::UpperEdge => "Smaller steps higher",
                 RangePhase::Lower => "Exploring lower",
+                RangePhase::LowerEdge => "Smaller steps lower",
+                RangePhase::Complete => "Complete",
             });
-            if let (Some(low), Some(high)) = (r.matched.iter().min(), r.matched.iter().max()) {
-                ui.small(format!("Matched {}–{}", dsp::name(*low), dsp::name(*high)));
+            if r.target.is_some() {
+                ui.small("One-second match · anywhere in green");
             }
         });
+        ui.small(r.hint);
+        if matches!(r.phase, RangePhase::Higher | RangePhase::UpperEdge) {
+            ui.small(
+                "3 unanswered repetitions → lower; singing above baseline gets one extra set.",
+            );
+        }
+        if matches!(r.phase, RangePhase::Lower | RangePhase::LowerEdge) {
+            ui.small("After 3 repetitions without a match, we finish with your matched notes.");
+        }
+        let phase = r.phase;
         ui.horizontal_wrapped(|ui| {
-            if self.range.as_ref().unwrap().phase == RangePhase::Baseline {
-                for (label, delta) in [("Lower", -1), ("Higher", 1)] {
-                    if ui.small_button(label).clicked() {
-                        let r = self.range.as_mut().unwrap();
-                        r.target = (r.target + delta).clamp(36, 84);
-                        self.range_reference();
-                    }
-                }
-            }
+            ui.small("Use headphones; stay in your relaxed usual voice.");
+            let guided = matches!(
+                phase,
+                RangePhase::Higher
+                    | RangePhase::UpperEdge
+                    | RangePhase::Lower
+                    | RangePhase::LowerEdge
+            );
             if ui
                 .add_enabled(
-                    !self.range.as_ref().unwrap().matched.is_empty(),
-                    egui::Button::new("Feels strained / can't reach").small(),
+                    guided,
+                    egui::Button::new(
+                        if matches!(phase, RangePhase::Higher | RangePhase::UpperEdge) {
+                            "Struggling — go lower"
+                        } else {
+                            "Struggling — finish"
+                        },
+                    )
+                    .small(),
                 )
                 .clicked()
             {
-                if self.range.as_mut().unwrap().limit() {
-                    self.finish_range();
-                } else {
-                    self.range_reference();
-                }
+                let event = self.range.as_mut().unwrap().limit();
+                self.range_event(event);
             }
-            if ui.small_button("Replay note").clicked() {
+            if ui
+                .add_enabled(
+                    self.range.as_ref().is_some_and(|r| r.target.is_some()),
+                    egui::Button::new("Replay note").small(),
+                )
+                .clicked()
+            {
                 self.range_reference();
             }
-            if ui.small_button("Finish").clicked() {
+            if ui
+                .add_enabled(
+                    self.range.as_ref().is_some_and(|r| r.matched.len() >= 2),
+                    egui::Button::new("Finish").small(),
+                )
+                .clicked()
+            {
                 self.finish_range();
             }
         });
@@ -735,9 +1084,23 @@ impl Coach {
                 }
             });
         }
-        self.reference_history_ui(ui);
+        if self
+            .range
+            .as_ref()
+            .is_none_or(|r| r.phase != RangePhase::Baseline)
+        {
+            self.reference_history_ui(ui);
+        }
         let end = latest - self.seconds_back;
-        let selected: Vec<&Guide> = if let Some(index) = self.guide {
+        let selected: Vec<&Guide> = if self
+            .range
+            .as_ref()
+            .is_some_and(|r| r.phase == RangePhase::Baseline)
+        {
+            Vec::new()
+        } else if self.view == View::Full {
+            self.guides.iter().collect()
+        } else if let Some(index) = self.guide {
             self.guides.get(index).into_iter().collect()
         } else if self.view != View::Spectrum
             && self.range.is_none()
@@ -867,20 +1230,32 @@ impl Coach {
                 .cloned()
                 .collect();
             let clips: Vec<_> = selected.iter().map(|g| g.frames.as_slice()).collect();
-            let pinned = crate::monitor::pinned_pitch(&clips, end);
+            let pinned = if self.view == View::Full {
+                crate::monitor::overview_pitch(&clips, end)
+            } else {
+                crate::monitor::pinned_pitch(&clips, end)
+            };
             crate::monitor::pitch_monitor(
                 ui,
                 &voice,
                 &pinned,
-                Some(self.active_target()),
+                self.active_target()
+                    .map(|note| crate::monitor::PitchTarget {
+                        note,
+                        tolerance_cents: if self.range.is_some() {
+                            crate::range::MATCH_CENTS
+                        } else {
+                            15.0
+                        },
+                    }),
                 self.view == View::Full,
                 height,
                 end,
             );
-            ui.small("Green = target · blue = microphone · purple = pinned example · session history retained");
+            ui.small(if self.active_target().is_none(){"Blue = your voice · hold an easy note to start · the piano joins afterward"}else{"Green = target · blue = microphone · purple = pinned example · session history retained"});
             if height >= 180.0 {
                 ui.small(if self.view == View::Full {
-                    "Full scale: C2–C6 · hover for any note · labels adapt to available space"
+                    "Full scale: C2–C6 · all saved guides fitted together · blue voice is live"
                 } else {
                     "Compact hides notes between distant ranges · hover the gap label for distance"
                 });
@@ -892,7 +1267,11 @@ impl Coach {
             return;
         }
         ui.horizontal(|ui| {
-            ui.small("Saved guides · click a note to review it");
+            ui.small(if self.view == View::Full {
+                "Saved guides · all shown · click for Compact review"
+            } else {
+                "Saved guides · click a note to review it"
+            });
             if self.guide.is_some() && ui.small_button("All notes").clicked() {
                 self.guide = None;
             }
@@ -918,7 +1297,7 @@ impl Coach {
                         });
                         if ui.is_rect_visible(rect) {
                             let p = ui.painter_at(rect);
-                            let ink = if index == selected {
+                            let ink = if self.view == View::Full || index == selected {
                                 PURPLE
                             } else {
                                 Color32::GRAY
@@ -1023,7 +1402,7 @@ impl Coach {
                                     }
                                 }
                             }
-                            if index == selected {
+                            if self.view == View::Full || index == selected {
                                 p.line_segment(
                                     [rect.left_bottom(), rect.right_bottom()],
                                     Stroke::new(2.0_f32, PURPLE),
@@ -1031,6 +1410,9 @@ impl Coach {
                             }
                         }
                         if response.clicked() {
+                            if self.view == View::Full {
+                                self.view = View::Compact;
+                            }
                             self.guide = Some(index);
                         }
                     }
@@ -1062,8 +1444,8 @@ impl Coach {
             let text_width=(ui.available_width()-48.0).max(80.0);
             ui.vertical(|ui|{
                 ui.set_width(text_width);
-                ui.add(egui::Label::new(if self.config.exercise==Exercise::Transition{"Listen, then sing one continuous ‘ah’: hold, move to the second note, and hold. Then pause."}else if self.config.mode==Mode::Performance{"Listen, then sing the note for one second. Slides are allowed."}else{"Listen, then sing ‘ah’ on the note for one second. Start without sliding."}).wrap());
-                ui.small(if self.config.exercise==Exercise::Transition{format!("Example · {} → {} · 0.8s each",dsp::name(self.config.target),dsp::name(self.config.target+self.config.interval))}else{format!("Example · {} · {:.1} Hz",dsp::name(self.config.target),dsp::hz(self.config.target as f32))});
+                ui.add(egui::Label::new(if self.config.exercise==Exercise::Transition{"Listen, then sing one continuous ‘ah’: hold for two seconds, move to the second note, and hold for two seconds. Then pause."}else if self.config.mode==Mode::Performance{"Listen, then sing the note for about two seconds. Slides are allowed."}else{"Listen, then sing ‘ah’ on the note for about two seconds. Start without sliding."}).wrap());
+                ui.small(if self.config.exercise==Exercise::Transition{format!("Example · {} → {} · 2s each",dsp::name(self.config.target),dsp::name(self.config.target+self.config.interval))}else{format!("Example · {} · {:.1} Hz",dsp::name(self.config.target),dsp::hz(self.config.target as f32))});
             });
             if crate::monitor::play_button(ui,self.example.is_some()).clicked(){if self.example.is_some(){self.stop_reference();}else{self.begin_example();}}
         });
@@ -1136,7 +1518,7 @@ impl Coach {
             ui.small("Hold ±15 cents for 100 ms");
             ui.small("≥85% periodicity · ≥350 ms singing");
         }
-        ui.small("Sine reference · 5 attempts · pause between each");
+        ui.small("Piano reference · 5 attempts · pause between each");
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{}/5 attempts", self.attempts.len()));
@@ -1453,19 +1835,285 @@ mod tests {
         c.history.extend(c.guides[0].frames.clone());
         c.feedback = Some(Result::Unscored("unclear".into()));
         c.reset();
-        assert_eq!(c.history.len(), 96);
+        assert_eq!(c.history.len(), 196);
         assert_eq!(c.guides.len(), 1);
         assert!(c.feedback.is_none());
         assert!(c.attempts.is_empty());
     }
     #[test]
+    fn range_starts_from_voice_without_audio_or_a_target_and_preserves_the_drill() {
+        let mut c = Coach::init(true);
+        c.accepted = Some((44, 60, 52));
+        c.config.target = 52;
+        c.feedback = Some(Result::Unscored("keep prior feedback".into()));
+        c.start_range();
+        assert!(
+            c.range_input_after <= c.now(),
+            "Voice-only discovery should listen immediately"
+        );
+        assert!(!c.player.playing);
+        assert!(c.example.is_none());
+        assert!(c.guides.is_empty());
+        assert_eq!(c.active_target(), None);
+        assert_eq!(c.range.as_ref().unwrap().phase, RangePhase::Baseline);
+        assert!(c.feedback.is_some());
+        assert_eq!(c.config.target, 52);
+        let cutoff = c.range_input_after;
+        for i in 0..130 {
+            c.observe_range_frame(&Frame {
+                time: cutoff - 2.0 + i as f64 * 0.01,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 1.0,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            });
+        }
+        assert_eq!(c.range.as_ref().unwrap().target, None);
+        let output = render_frames(&mut c, [720.0, 640.0]);
+        for label in [
+            "Sing an easy note",
+            "Finding your starting note",
+            "Use headphones",
+        ] {
+            assert!(text_bounds(&output, label).bottom() < 640.0);
+        }
+        c.range = None;
+        c.stop_reference();
+        assert!(c.feedback.is_some());
+        assert_eq!(c.config.target, 52);
+    }
+    #[test]
+    fn queued_voice_from_before_reference_readiness_does_not_count() {
+        let mut r = Range::new();
+        for i in 0..130 {
+            r.observe(
+                &Frame {
+                    time: i as f64 * 0.01,
+                    hz: Some(dsp::hz(48.0)),
+                    confidence: 1.0,
+                    rms: 0.1,
+                    clipped: false,
+                    spectrum: None,
+                },
+                false,
+            );
+        }
+        let mut c = Coach::init(true);
+        c.range = Some(r);
+        c.player.playing = true;
+        c.player.ready = true;
+        c.range_reference_ready_at = Some(10.0);
+        for i in 0..150 {
+            c.observe_range_frame(&Frame {
+                time: 8.0 + i as f64 * 0.01,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 1.0,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            });
+        }
+        assert_eq!(c.range.as_ref().unwrap().successes, 0);
+        assert!(c.range.as_ref().unwrap().matched.is_empty());
+        for i in 0..30 {
+            c.observe_range_frame(&Frame {
+                time: 11.0 + i as f64 * 0.01,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 1.0,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            });
+        }
+        assert!(c.range.as_ref().unwrap().hold > 0.25);
+        c.player.ready = false;
+        c.observe_range_frame(&Frame {
+            time: 11.3,
+            hz: Some(dsp::hz(48.0)),
+            confidence: 1.0,
+            rms: 0.1,
+            clipped: false,
+            spectrum: None,
+        });
+        assert_eq!(c.range.as_ref().unwrap().hold, 0.0);
+    }
+    #[test]
+    fn range_ui_shows_confirmation_and_direction_controls_at_minimum_size() {
+        for phase in [
+            RangePhase::ConfirmStart,
+            RangePhase::Higher,
+            RangePhase::UpperEdge,
+            RangePhase::Lower,
+            RangePhase::LowerEdge,
+        ] {
+            let mut c = Coach::init(true);
+            let mut r = Range::new();
+            r.phase = phase;
+            r.target = Some(55);
+            r.matched = vec![53, 55];
+            c.range = Some(r);
+            let output = render_frames(&mut c, [720.0, 640.0]);
+            for label in [
+                "One-second match",
+                "Reference not ready",
+                "Replay note",
+                "Finish",
+            ] {
+                let bounds = text_bounds(&output, label);
+                assert!(
+                    bounds.bottom() < 640.0 && bounds.right() < 720.0,
+                    "{phase:?}: {label} {bounds:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn coaching_callouts_fit_wide_and_narrow_headers() {
+        for size in [[960.0, 760.0], [720.0, 640.0]] {
+            for (phase, title) in [
+                (RangePhase::Higher, "Go higher"),
+                (RangePhase::Lower, "Go lower"),
+            ] {
+                let mut c = Coach::init(true);
+                let mut r = Range::new();
+                r.phase = phase;
+                r.target = Some(55);
+                r.matched = vec![48, 55];
+                c.range = Some(r);
+                let output = render_frames(&mut c, size);
+                let bounds = text_bounds(&output, title);
+                assert!(
+                    bounds.right() <= size[0] && bounds.bottom() < 220.0,
+                    "{size:?}: {bounds:?}"
+                );
+                if size[0] == 960.0 {
+                    assert!(bounds.left() > 600.0);
+                }
+            }
+            let mut c = Coach::init(true);
+            c.accepted = Some((45, 65, 55));
+            c.accepted_sustain = Some((65, 4.2));
+            let output = render_frames(&mut c, size);
+            assert!(text_bounds(&output, "Complete").bottom() < 220.0);
+            assert!(text_bounds(&output, "Highest sustain: F4").right() <= size[0]);
+            let estimate = text_bounds(&output, "Estimate: Baritone");
+            assert!(estimate.right() <= size[0] && estimate.bottom() < 220.0);
+        }
+    }
+    #[test]
+    fn callout_size_and_alignment_stay_stable_across_messages_and_widths() {
+        for width in [720.0, 800.0, 960.0, 1200.0] {
+            let mut previous: Option<egui::Rect> = None;
+            for state in 0..7 {
+                let mut c = Coach::init(true);
+                let mut r = Range::new();
+                r.phase = match state {
+                    0 => RangePhase::Baseline,
+                    1 => RangePhase::Higher,
+                    2 => RangePhase::Lower,
+                    _ => RangePhase::ConfirmStart,
+                };
+                r.target = Some(55);
+                r.matched = vec![48, 55];
+                if state == 3 {
+                    for i in 0..210 {
+                        r.observe_guided(
+                            &Frame {
+                                time: i as f64 * 0.01,
+                                hz: Some(dsp::hz(55.0)),
+                                confidence: 0.99,
+                                rms: 0.1,
+                                clipped: false,
+                                spectrum: None,
+                            },
+                            true,
+                            Some(0.0),
+                        );
+                    }
+                }
+                c.range = Some(r);
+                if state == 4 {
+                    c.range_resume_at = Some(999.0);
+                }
+                if state == 5 {
+                    c.range = None;
+                    c.accepted = Some((45, 65, 55));
+                    c.accepted_sustain = Some((65, 4.2));
+                }
+                if state == 6 {
+                    c.range = None;
+                    c.accepted = None;
+                }
+                let output = render_frames(&mut c, [width, 760.0]);
+                let card = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(24, 38, 49) => {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("Coaching card must be visible");
+                assert!(
+                    card.left() > width * 0.5 && card.right() <= width,
+                    "{width} state {state}: {card:?}"
+                );
+                if let Some(prev) = previous {
+                    assert!(
+                        (prev.min - card.min).length() < 1.0
+                            && (prev.size() - card.size()).length() < 1.0,
+                        "{width} state {state}: {prev:?} -> {card:?}"
+                    );
+                }
+                previous = Some(card);
+                assert!(
+                    (card.height() - 60.0).abs() < 0.1,
+                    "Instruction cue stays twice the toolbar button height"
+                );
+            }
+        }
+    }
+    #[test]
+    fn direction_change_pauses_and_ignores_microphone_backlog() {
+        let mut c = Coach::init(true);
+        let mut r = Range::new();
+        r.phase = RangePhase::Higher;
+        r.target = Some(67);
+        r.matched = vec![60, 65];
+        let event = r.limit();
+        c.range = Some(r);
+        let before = c.now();
+        c.range_event(event);
+        assert!(c.range_resume_at.unwrap() >= before + 2.0);
+        assert!(!c.player.playing);
+        assert!(c.range_descending);
+        for i in 0..200 {
+            c.observe_range_frame(&Frame {
+                time: before + i as f64 * 0.01,
+                hz: Some(dsp::hz(63.0)),
+                confidence: 0.99,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            });
+        }
+        assert_eq!(c.range.as_ref().unwrap().target, Some(63));
+        assert_eq!(c.range.as_ref().unwrap().hold, 0.0);
+        let output = render_frames(&mut c, [720.0, 640.0]);
+        assert!(text_bounds(&output, "Breathe · then lower").bottom() < 220.0);
+    }
+    #[test]
     fn range_completion_applies_matched_middle() {
         let mut c = Coach::init(true);
-        let mut r = Range::new(48);
+        let mut r = Range::new();
         r.matched = vec![48, 50, 52, 46, 44];
+        r.highest_sustain = Some((52, 3.2));
         c.range = Some(r);
         c.finish_range();
         assert_eq!(c.accepted, Some((44, 52, 48)));
+        assert_eq!(c.accepted_sustain, Some((52, 3.2)));
         assert_eq!(c.config.target, 48);
         assert!(c.range.is_none());
         assert!(!c.player.playing);

@@ -1,6 +1,8 @@
 mod audio;
 mod dsp;
 mod monitor;
+mod piano;
+mod range;
 mod training;
 mod ui;
 fn main() -> eframe::Result {

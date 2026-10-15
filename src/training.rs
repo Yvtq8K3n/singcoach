@@ -285,118 +285,7 @@ pub fn summarize(v: &[Measured]) -> Summary {
         reliability: (mean - spread).clamp(0.0, 100.0),
     }
 }
-#[derive(PartialEq, Debug)]
-pub enum RangePhase {
-    Baseline,
-    Higher,
-    Lower,
-}
-pub struct Range {
-    pub target: i32,
-    pub phase: RangePhase,
-    pub matched: Vec<i32>,
-    pub hold: f32,
-    hold_start: Option<f64>,
-    baseline: Vec<(f64, f32)>,
-}
-impl Range {
-    pub fn new(target: i32) -> Self {
-        Self {
-            target,
-            phase: RangePhase::Baseline,
-            matched: Vec::new(),
-            hold: 0.0,
-            hold_start: None,
-            baseline: Vec::new(),
-        }
-    }
-    pub fn reset_hold(&mut self) {
-        self.hold = 0.0;
-        self.hold_start = None;
-        self.baseline.clear();
-    }
-    pub fn observe(&mut self, f: &Frame, ready: bool) -> bool {
-        if !ready {
-            self.reset_hold();
-            return false;
-        }
-        if self.phase == RangePhase::Baseline && f.confidence >= 0.85 && !f.clipped {
-            if let Some(h) = f.hz {
-                self.baseline.push((f.time, crate::dsp::midi(h)));
-                self.baseline.retain(|(t, _)| f.time - t <= 1.6);
-                let notes: Vec<_> = self.baseline.iter().map(|(_, n)| *n).collect();
-                if self.baseline.len() > 100
-                    && f.time - self.baseline[0].0 >= 1.5
-                    && sd(&notes) < 0.25
-                {
-                    let note = median(&notes).round() as i32;
-                    if note != self.target && (36..=84).contains(&note) {
-                        self.target = note;
-                        self.reset_hold();
-                        return true;
-                    }
-                }
-            }
-        } else {
-            self.baseline.clear();
-        }
-        if f.confidence >= 0.85
-            && !f.clipped
-            && f.hz.is_some_and(|h| cents(h, self.target).abs() <= 75.0)
-        {
-            let start = *self.hold_start.get_or_insert(f.time);
-            self.hold = (f.time - start) as f32;
-            if self.hold >= 1.0 {
-                if !self.matched.contains(&self.target) {
-                    self.matched.push(self.target);
-                }
-                if self.phase == RangePhase::Baseline {
-                    self.phase = RangePhase::Higher;
-                }
-                self.target = (self.target
-                    + if self.phase == RangePhase::Higher {
-                        2
-                    } else {
-                        -2
-                    })
-                .clamp(36, 84);
-                self.reset_hold();
-                return true;
-            }
-        } else {
-            self.hold = 0.0;
-            self.hold_start = None;
-        }
-        false
-    }
-    pub fn limit(&mut self) -> bool {
-        if self.phase == RangePhase::Lower {
-            return true;
-        }
-        if let Some(first) = self.matched.first() {
-            self.phase = RangePhase::Lower;
-            self.target = (*first - 2).max(36);
-            self.reset_hold();
-            false
-        } else {
-            false
-        }
-    }
-    pub fn recommendation(&self) -> Option<(i32, i32, i32)> {
-        let low = *self.matched.iter().min()?;
-        let high = *self.matched.iter().max()?;
-        if low == high {
-            return None;
-        }
-        let mid = (low + high) as f32 / 2.0;
-        let n = *self.matched.iter().min_by(|a, b| {
-            ((**a as f32 - mid).abs())
-                .total_cmp(&(**b as f32 - mid).abs())
-                .then(a.cmp(b))
-        })?;
-        Some((low, high, n))
-    }
-}
+pub use crate::range::{Range, RangeEvent, RangePhase};
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,18 +380,6 @@ mod tests {
             Result::Unscored(_)
         ));
     }
-    #[test]
-    fn range_requires_ready_reference() {
-        let mut r = Range::new(48);
-        for f in frames(|_| Some(0.0), 150) {
-            r.observe(&f, false);
-        }
-        assert!(r.matched.is_empty());
-        for f in frames(|_| Some(0.0), 150) {
-            r.observe(&f, true);
-        }
-        assert_eq!(r.matched, vec![48]);
-    }
 }
 
 #[cfg(test)]
@@ -577,32 +454,5 @@ mod pipeline_tests {
         }
         let frames = output.unwrap();
         assert!(frames.iter().any(|f| f.hz.is_none()));
-    }
-    #[test]
-    fn failed_reference_resets_partial_range_hold() {
-        let mut r = Range::new(48);
-        for i in 0..90 {
-            let f = Frame {
-                time: i as f64 * 0.01,
-                hz: Some(crate::dsp::hz(48.0)),
-                confidence: 1.0,
-                rms: 0.1,
-                clipped: false,
-                spectrum: None,
-            };
-            r.observe(&f, true);
-        }
-        assert!(r.hold > 0.8);
-        let f = Frame {
-            time: 0.9,
-            hz: Some(crate::dsp::hz(48.0)),
-            confidence: 1.0,
-            rms: 0.1,
-            clipped: false,
-            spectrum: None,
-        };
-        r.observe(&f, false);
-        assert_eq!(r.hold, 0.0);
-        assert!(r.matched.is_empty());
     }
 }
