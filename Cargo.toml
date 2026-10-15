@@ -1,0 +1,9 @@
+[package]
+name = "singcoach"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+cpal = "=0.15.3"
+ringbuf = "=0.4.8"
