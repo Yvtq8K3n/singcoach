@@ -237,18 +237,31 @@ impl Windows {
         second: Option<i32>,
         once: bool,
     ) -> std::result::Result<(), String> {
+        self.play_pcm(note, second, once, None)
+    }
+    fn play_pcm(
+        &mut self,
+        note: i32,
+        second: Option<i32>,
+        once: bool,
+        pcm: Option<&[f32]>,
+    ) -> std::result::Result<(), String> {
         self.epoch += 1;
         let path = std::env::temp_dir().join(format!(
             "singcoach-{}-{}.wav",
             std::process::id(),
             self.epoch
         ));
-        write_wave(
-            &path,
-            dsp::hz(note as f32),
-            second.map(|n| dsp::hz(n as f32)),
-            once,
-        )?;
+        if let Some(samples) = pcm {
+            write_pcm(&path, samples, 48000)?;
+        } else {
+            write_wave(
+                &path,
+                dsp::hz(note as f32),
+                second.map(|n| dsp::hz(n as f32)),
+                once,
+            )?;
+        }
         let translated = Command::new("wslpath")
             .arg("-w")
             .arg(&path)
@@ -299,6 +312,13 @@ fn write_wave(
     } else {
         piano::range_loop(freq, rate)
     };
+    write_pcm(path, &samples, rate)
+}
+fn write_pcm(
+    path: &std::path::Path,
+    samples: &[f32],
+    rate: u32,
+) -> std::result::Result<(), String> {
     let len = samples.len() as u32;
     let bytes = len * 2;
     let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
@@ -326,6 +346,8 @@ pub fn render_example(first: f32, second: Option<f32>, rate: u32) -> Vec<f32> {
 }
 
 struct Native {
+    sequence: Arc<[(AtomicU32, AtomicU32); 5]>,
+    sequence_mode: Arc<AtomicBool>,
     _stream: cpal::Stream,
     frequency: Arc<AtomicU32>,
     strike: Arc<AtomicU32>,
@@ -352,7 +374,16 @@ impl Native {
         let ready = observed.clone();
         let strike = Arc::new(AtomicU32::new(0));
         let strikes = strike.clone();
-        let mut piano = Piano::new(config.sample_rate.0);
+        let sequence = Arc::new(std::array::from_fn(|_| {
+            (AtomicU32::new(0), AtomicU32::new(0))
+        }));
+        let schedule = sequence.clone();
+        let sequence_mode = Arc::new(AtomicBool::new(false));
+        let sequence_active = sequence_mode.clone();
+        let rate = config.sample_rate.0;
+        let mut notes = [(0.0f32, 0u64); 5];
+        let (mut sequence_index, mut remaining, mut sequenced) = (0usize, 0u64, false);
+        let mut piano = Piano::new(rate);
         let (mut last_strike, mut was_active) = (0u32, false);
         macro_rules! stream {
             ($t:ty,$convert:expr) => {
@@ -363,7 +394,23 @@ impl Native {
                             let enabled = active.load(Ordering::Relaxed);
                             let epoch = strikes.load(Ordering::Acquire);
                             if enabled && (!was_active || epoch != last_strike) {
-                                piano.strike(f32::from_bits(freq.load(Ordering::Relaxed)));
+                                sequenced = sequence_active.load(Ordering::Relaxed);
+                                if sequenced {
+                                    for (dst, src) in notes.iter_mut().zip(schedule.iter()) {
+                                        *dst = (
+                                            f32::from_bits(src.0.load(Ordering::Relaxed)),
+                                            src.1.load(Ordering::Relaxed) as u64 * rate as u64
+                                                / 1000,
+                                        );
+                                    }
+                                    sequence_index = 0;
+                                    remaining = notes[0].1;
+                                }
+                                piano.strike(if sequenced {
+                                    notes[0].0
+                                } else {
+                                    f32::from_bits(freq.load(Ordering::Relaxed))
+                                });
                                 last_strike = epoch;
                                 ready.store(true, Ordering::Relaxed);
                             } else if !enabled && was_active {
@@ -371,6 +418,19 @@ impl Native {
                             }
                             was_active = enabled;
                             for frame in output.chunks_exact_mut(channels) {
+                                if enabled && sequenced {
+                                    if remaining == 0 {
+                                        sequence_index += 1;
+                                        if sequence_index < 5 {
+                                            piano.strike(notes[sequence_index].0);
+                                            remaining = notes[sequence_index].1;
+                                        } else {
+                                            piano.stop();
+                                            sequenced = false;
+                                        }
+                                    }
+                                    remaining = remaining.saturating_sub(1);
+                                }
                                 let sample = piano.sample();
                                 for v in frame {
                                     *v = ($convert)(sample);
@@ -393,6 +453,8 @@ impl Native {
         };
         stream.play().map_err(|e| e.to_string())?;
         Ok(Self {
+            sequence,
+            sequence_mode,
             _stream: stream,
             frequency,
             strike,
@@ -447,6 +509,7 @@ impl Player {
         }
         match self.backend.as_mut().unwrap() {
             Backend::Native(n) => {
+                n.sequence_mode.store(false, Ordering::Relaxed);
                 n.frequency
                     .store(dsp::hz(note as f32).to_bits(), Ordering::Relaxed);
                 n.observed.store(false, Ordering::Relaxed);
@@ -454,6 +517,37 @@ impl Player {
                 n.enabled.store(true, Ordering::Relaxed);
             }
             Backend::Windows(w) => w.play(note, second, once)?,
+        }
+        self.playing = true;
+        self.requested = Instant::now();
+        Ok(())
+    }
+    /// One fixed five-note sequence; scheduling is sample-based in the native callback.
+    pub fn melody(&mut self, notes: &[(i32, u32); 5]) -> std::result::Result<(), String> {
+        self.stop();
+        self.error = None;
+        if self.backend.is_none() {
+            self.backend = Some(if is_wsl() {
+                Backend::Windows(Windows::new()?)
+            } else {
+                Backend::Native(Native::new()?)
+            });
+        }
+        match self.backend.as_mut().unwrap() {
+            Backend::Windows(w) => {
+                w.play_pcm(notes[0].0, None, true, Some(&piano::sequence(notes, 48000)))?
+            }
+            Backend::Native(n) => {
+                for (dst, src) in n.sequence.iter().zip(notes) {
+                    dst.0
+                        .store(dsp::hz(src.0 as f32).to_bits(), Ordering::Relaxed);
+                    dst.1.store(src.1, Ordering::Relaxed);
+                }
+                n.sequence_mode.store(true, Ordering::Relaxed);
+                n.observed.store(false, Ordering::Relaxed);
+                n.strike.fetch_add(1, Ordering::Release);
+                n.enabled.store(true, Ordering::Relaxed);
+            }
         }
         self.playing = true;
         self.requested = Instant::now();

@@ -181,6 +181,13 @@ impl From<i32> for PitchTarget {
     }
 }
 /// A semitone axis keeps equal musical intervals equally spaced.
+/// An indicative target marker, never pitch evidence or synthesized audio.
+pub struct PitchGuide {
+    pub note: i32,
+    pub start: f64,
+    pub end: f64,
+}
+#[cfg(test)]
 pub fn pitch_monitor(
     ui: &mut egui::Ui,
     trace: &VecDeque<Frame>,
@@ -190,6 +197,18 @@ pub fn pitch_monitor(
     height: f32,
     end: f64,
 ) {
+    pitch_monitor_guided(ui, trace, examples, (target, &[]), full_scale, height, end);
+}
+pub fn pitch_monitor_guided(
+    ui: &mut egui::Ui,
+    trace: &VecDeque<Frame>,
+    examples: &VecDeque<Frame>,
+    guidance: (Option<PitchTarget>, &[PitchGuide]),
+    full_scale: bool,
+    height: f32,
+    end: f64,
+) {
+    let (target, indicators) = guidance;
     let trace_color = Color32::LIGHT_BLUE;
     let voice_note = trace
         .iter()
@@ -214,8 +233,15 @@ pub fn pitch_monitor(
             .and_then(valid_midi)
             .map(|note| note.round() as i32)
     }));
+    notes.extend(indicators.iter().map(|guide| guide.note));
     notes.sort_unstable();
     notes.dedup();
+    if !full_scale && notes.len() < 11 {
+        // Fill the compact grid around the target instead of reserving blank rows.
+        notes.extend(target - 5..=target + 5);
+        notes.sort_unstable();
+        notes.dedup();
+    }
     if full_scale {
         notes = (36..=84).collect();
     }
@@ -243,13 +269,7 @@ pub fn pitch_monitor(
     if plot.width() <= 0.0 {
         return;
     }
-    // Compact keeps row sizes fixed, even when the two ranges overlap.
-    let step = plot.height()
-        / if full_scale {
-            slot as f32
-        } else {
-            (slot as f32).max(11.0)
-        };
+    let step = plot.height() / slot as f32;
     let y = |note: f32| {
         let &(nearest, lane) = lanes
             .iter()
@@ -392,6 +412,22 @@ pub fn pitch_monitor(
             Color32::from_rgba_unmultiplied(100, 230, 150, 35),
         );
     }
+    // Faint guide lines are drawn directly, independently of pitch evidence.
+    for guide in indicators {
+        let left =
+            (plot.right() - ((end - guide.start) / 3.0) as f32 * plot.width()).max(plot.left());
+        let right =
+            (plot.right() - ((end - guide.end) / 3.0) as f32 * plot.width()).min(plot.right());
+        if right > left {
+            painter.with_clip_rect(plot).line_segment(
+                [
+                    egui::pos2(left, y(guide.note as f32)),
+                    egui::pos2(right, y(guide.note as f32)),
+                ],
+                Stroke::new(1.5_f32, PURPLE.gamma_multiply(0.65)),
+            );
+        }
+    }
     for seconds in 0..=3 {
         let x = plot.right() - seconds as f32 / 3.0 * plot.width();
         painter.line_segment(
@@ -433,10 +469,7 @@ pub fn pitch_monitor(
         );
     }
     let voice_painter = painter.with_clip_rect(plot);
-    for (history, trace_color) in [
-        (examples, Color32::from_rgb(210, 170, 255)),
-        (trace, Color32::LIGHT_BLUE),
-    ] {
+    for (history, trace_color) in [(examples, PURPLE), (trace, Color32::LIGHT_BLUE)] {
         let mut previous: Option<(egui::Pos2, f64)> = None;
         for frame in history {
             let note = frame
@@ -664,6 +697,39 @@ mod tests {
         assert_ne!(spectral_color(-90.0, 0.0), spectral_color(-90.0, 30.0));
     }
     #[test]
+    fn compact_grid_fills_the_plot_and_centers_a_nearby_voice() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                pitch_monitor(
+                    ui,
+                    &VecDeque::from([frame(1.0, 48)]),
+                    &VecDeque::new(),
+                    Some(48.into()),
+                    false,
+                    240.0,
+                    1.0,
+                );
+            });
+        });
+        let label_y = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text() == label => Some(t.pos.y),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            label_y("F3") < 45.0,
+            "Top of the grid must contain note rows"
+        );
+        assert!((90.0..140.0).contains(&label_y("Target · C3")));
+        assert!(label_y("G2") > 190.0);
+    }
+    #[test]
     fn compact_chart_retains_distant_voice_and_target() {
         let ctx = egui::Context::default();
         let trace = VecDeque::from([frame(1.0, 72)]);
@@ -750,4 +816,177 @@ mod tolerance_tests {
         };
         assert!((band_height(75.0) / band_height(15.0) - 5.0).abs() < 0.01);
     }
+}
+
+pub fn melody_path(
+    ui: &mut egui::Ui,
+    coach: &crate::melody::Coach,
+    now: f64,
+    height: f32,
+    view: View,
+    live: Option<&Frame>,
+) {
+    use crate::melody::{metric, State, Status};
+    let live = live.filter(|f| crate::melody::reliable(f) && now >= f.time && now - f.time <= 0.25);
+    let live_note = live.map(|f| dsp::midi(f.hz.unwrap()));
+    let notes = coach.notes();
+    let low = if view == View::Full {
+        36
+    } else {
+        (notes.iter().map(|n| n.midi).min().unwrap() - 2)
+            .min(live_note.map_or(84, |n| n.floor() as i32 - 1))
+    };
+    let high = if view == View::Full {
+        84
+    } else {
+        (notes.iter().map(|n| n.midi).max().unwrap() + 2)
+            .max(live_note.map_or(36, |n| n.ceil() as i32 + 1))
+    };
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height.max(160.0)),
+        egui::Sense::hover(),
+    );
+    let plot = egui::Rect::from_min_max(
+        rect.min + egui::vec2(45.0, 10.0),
+        rect.max - egui::vec2(8.0, 25.0),
+    );
+    let x = |t: f64| plot.left() + t as f32 / coach.duration() as f32 * plot.width();
+    let y = |m: f32| plot.bottom() - (m - low as f32) / (high - low) as f32 * plot.height();
+    let p = ui.painter_at(rect);
+    p.rect_filled(plot, 0.0, spectral_color(-120.0, 12.0));
+    let clipped = p.with_clip_rect(plot);
+    if view == View::Spectrum {
+        for frame in &coach.frames {
+            if let Some(bins) = &frame.spectrum {
+                for (i, db) in bins.iter().enumerate() {
+                    let hz = 65.0 * (4000.0_f32 / 65.0).powf(i as f32 / 63.0);
+                    let midi = dsp::midi(hz);
+                    let next = dsp::midi(hz * (4000.0_f32 / 65.0).powf(1.0 / 63.0));
+                    clipped.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x(frame.time), y(next)),
+                            egui::pos2(x(frame.time + 0.1), y(midi)),
+                        ),
+                        0.0,
+                        spectral_color(*db, 12.0),
+                    );
+                }
+            }
+        }
+    }
+    for m in low..=high {
+        p.line_segment(
+            [
+                egui::pos2(plot.left(), y(m as f32)),
+                egui::pos2(plot.right(), y(m as f32)),
+            ],
+            Stroke::new(0.5_f32, Color32::DARK_GRAY),
+        );
+        p.text(
+            egui::pos2(rect.left(), y(m as f32)),
+            egui::Align2::LEFT_CENTER,
+            dsp::name(m),
+            egui::FontId::proportional(11.0),
+            Color32::GRAY,
+        );
+    }
+    for t in 0..=coach.duration() as usize {
+        p.line_segment(
+            [
+                egui::pos2(x(t as f64), plot.top()),
+                egui::pos2(x(t as f64), plot.bottom()),
+            ],
+            Stroke::new(0.5_f32, Color32::DARK_GRAY),
+        );
+        p.text(
+            egui::pos2(x(t as f64), plot.bottom() + 6.0),
+            egui::Align2::CENTER_TOP,
+            format!("{t}s"),
+            egui::FontId::proportional(11.0),
+            Color32::GRAY,
+        );
+    }
+    for (i, n) in notes.iter().enumerate() {
+        let a = coach.result.as_ref().map(|r| &r.notes[i]);
+        let (color, label) = match a.map(|a| a.status) {
+            Some(Status::Good) => (Color32::DARK_GREEN, "✓"),
+            Some(Status::Improve) => (Color32::from_rgb(130, 85, 15), "!"),
+            Some(Status::Unscored) => (Color32::DARK_GRAY, "?"),
+            None => (PURPLE.gamma_multiply(0.18), "·"),
+        };
+        let r = egui::Rect::from_min_max(
+            egui::pos2(x(n.start), y(n.midi as f32 + 0.42)),
+            egui::pos2(x(n.start + n.duration), y(n.midi as f32 - 0.42)),
+        );
+        p.rect_filled(r, 3.0, color.gamma_multiply(0.65));
+        clipped.line_segment(
+            [
+                egui::pos2(x(n.start), y(n.midi as f32)),
+                egui::pos2(x(n.start + n.duration), y(n.midi as f32)),
+            ],
+            Stroke::new(2.0_f32, PURPLE),
+        );
+        p.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{label} {}", dsp::name(n.midi)),
+            egui::FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        ui.interact(r, ui.id().with(("melody_note", i)), egui::Sense::hover())
+            .on_hover_text(if let Some(a) = a {
+                format!(
+                    "Nota {} · cobertura {:.0}% · viés {} · erro absoluto {} · afinado {}",
+                    i + 1,
+                    a.coverage * 100.0,
+                    metric(a.bias, "¢"),
+                    metric(a.absolute, "¢"),
+                    metric(a.in_tune.map(|r| 100.0 * r), "%")
+                )
+            } else {
+                format!("{} · {:.1}s", dsp::name(n.midi), n.duration)
+            });
+    }
+    for (i, pair) in coach.frames.windows(2).enumerate() {
+        if i % 4 < 2 && crate::melody::connected(&pair[0], &pair[1]) {
+            clipped.line_segment(
+                [
+                    egui::pos2(x(pair[0].time), y(dsp::midi(pair[0].hz.unwrap()))),
+                    egui::pos2(x(pair[1].time), y(dsp::midi(pair[1].hz.unwrap()))),
+                ],
+                Stroke::new(2.0_f32, Color32::LIGHT_BLUE),
+            );
+        }
+    }
+    // Live monitoring is independent of the timed, scored attempt trace.
+    if let Some(note) = live_note {
+        let point = egui::pos2(plot.right() - 5.0, y(note));
+        clipped.circle_filled(point, 4.0, BLUE);
+        p.text(
+            point - egui::vec2(9.0, 9.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("Live {}", dsp::name(note.round() as i32)),
+            egui::FontId::proportional(12.0),
+            BLUE,
+        );
+    }
+    let cursor = match coach.state {
+        State::Recording { start } => Some(live.map_or_else(
+            || coach.frames.last().map_or(0.0, |f| f.time),
+            |f| f.time - start,
+        )),
+        State::Playback => coach.playback_start.map(|start| now - start),
+        _ => None,
+    };
+    if let Some(elapsed) = cursor {
+        let t = elapsed.clamp(0.0, coach.duration());
+        p.line_segment(
+            [
+                egui::pos2(x(t), plot.top()),
+                egui::pos2(x(t), plot.bottom()),
+            ],
+            Stroke::new(1.0_f32, Color32::WHITE),
+        );
+    }
+    ui.small("Purple: piano path · Azul tracejado: voz · ✓ verde: afinado · ! âmbar: melhorar · ? cinzento: dados insuficientes");
 }

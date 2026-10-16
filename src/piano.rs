@@ -139,6 +139,23 @@ pub fn example(first: f32, second: Option<f32>, rate: u32) -> Vec<f32> {
         .collect()
 }
 
+/// Prepared melody for the existing Windows WAV route.
+pub fn sequence(notes: &[(i32, u32); 5], rate: u32) -> Vec<f32> {
+    let mut piano = Piano::new(rate);
+    let mut pcm = Vec::new();
+    for &(note, milliseconds) in notes {
+        piano.strike(crate::dsp::hz(note as f32));
+        for _ in 0..(milliseconds as u64 * rate as u64 / 1000) {
+            pcm.push(piano.sample());
+        }
+    }
+    piano.stop();
+    for _ in 0..rate / 20 {
+        pcm.push(piano.sample());
+    }
+    pcm
+}
+
 /// Warm up one restrike period so the Windows loop has the same ringing tail
 /// at both ends. It can repeat indefinitely without resetting at a hard edge.
 pub fn range_loop(hz: f32, rate: u32) -> Vec<f32> {

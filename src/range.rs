@@ -196,7 +196,7 @@ impl Range {
                     "Let's use smaller steps. A one-second ‘ah’ is enough.",
                 )
             }
-            RangePhase::Lower if anchor - note > 1 => {
+            RangePhase::Lower if anchor - note == 2 => {
                 self.step = 1;
                 self.change(
                     anchor - 1,
@@ -392,6 +392,10 @@ impl Range {
             _ => self.highest_sustain = Some((note, self.sustain_seconds)),
         }
     }
+    pub fn holding_match(&self) -> bool {
+        self.pending_match
+            .is_some_and(|(_, until)| !until.is_finite())
+    }
     pub fn held_seconds(&self) -> f64 {
         self.sustain_seconds
     }
@@ -544,7 +548,7 @@ impl Range {
         RangeEvent::None
     }
     /// Three ready piano repetitions skip an unanswered prompt. Higher
-    /// singing protects the climb only; the lower search ends after three.
+    /// singing protects the climb only; unanswered lower prompts step down.
     pub fn reference_elapsed(&mut self, seconds: f64, now: f64, ready: bool) -> RangeEvent {
         if self.pending_match.is_some()
             || !ready
@@ -560,7 +564,18 @@ impl Range {
             {
                 self.begin_lower()
             }
-            RangePhase::Lower | RangePhase::LowerEdge => self.complete(),
+            RangePhase::Lower | RangePhase::LowerEdge => {
+                let note = self.target.expect("Lower search has a target");
+                if note <= 36 || self.baseline_note.is_some_and(|baseline| note < baseline) {
+                    self.complete()
+                } else {
+                    self.change(
+                        (note - self.step).max(36),
+                        RangePhase::Lower,
+                        "No match yet. Try this lower note; only matched notes enter your result.",
+                    )
+                }
+            }
             _ => RangeEvent::None,
         }
     }
@@ -1068,49 +1083,63 @@ mod tests {
         assert_eq!(s.range.phase, RangePhase::Lower);
         assert_eq!(s.range.target, Some(61));
         assert_eq!(s.range.matched, vec![63]);
-        // An unanswered low prompt now finishes automatically.
+        // This prompt is already below the discovered start: end after three runs.
         assert_eq!(
             s.range.reference_elapsed(6.0, s.time, true),
             RangeEvent::Complete
         );
     }
     #[test]
-    fn low_prompt_timeout_finishes_with_only_matched_notes_and_stage_messages() {
+    fn low_prompts_retry_down_from_high_but_finish_below_start() {
         let mut s = Singer::new();
         s.discover(48);
-        s.confirm();
-        assert!(s.range.stage_message().contains("Let's go up"));
-        s.confirm();
-        s.range.limit();
-        assert!(s.range.stage_message().contains("Highest matched: D3"));
-        assert!(s.range.stage_message().contains("Let's go down"));
         s.confirm(); // C3
-        s.confirm(); // A#2
-        assert!(s
-            .range
-            .stage_message()
-            .contains(&format!("Last matched note: {}", dsp::name(46))));
-        assert_eq!(s.range.target, Some(44));
-        // Singing well above the baseline must not protect a low prompt.
+        s.confirm(); // D3
+        s.confirm(); // E3
+        s.confirm(); // F#3
+        s.range.limit();
+        assert_eq!(s.range.target, Some(52));
+        let matched = s.range.matched.clone();
+        for target in [50, 48, 46] {
+            assert_eq!(
+                s.range.reference_elapsed(5.99, s.time, true),
+                RangeEvent::None
+            );
+            assert_eq!(
+                s.range.reference_elapsed(60.0, s.time, false),
+                RangeEvent::None
+            );
+            assert_eq!(
+                s.range.reference_elapsed(6.0, s.time, true),
+                RangeEvent::ReferenceChanged
+            );
+            assert_eq!(s.range.target, Some(target));
+            assert_eq!(s.range.matched, matched);
+        }
+        // No endless descent below the discovered starting note.
         s.sing(55.0, 1.1, true);
-        assert_eq!(
-            s.range.reference_elapsed(5.99, s.time, true),
-            RangeEvent::None
-        );
-        assert_eq!(
-            s.range.reference_elapsed(60.0, s.time, false),
-            RangeEvent::None
-        );
         assert_eq!(
             s.range.reference_elapsed(6.0, s.time, true),
             RangeEvent::Complete
         );
-        assert_eq!(s.range.recommendation().map(|r| (r.0, r.1)), Some((46, 50)));
+        assert_eq!(s.range.matched, matched);
+        assert_eq!(s.range.recommendation().map(|r| (r.0, r.1)), Some((48, 54)));
+        assert!(s.range.stage_message().contains("Lowest matched: C3"));
+    }
+    #[test]
+    fn matched_lower_notes_continue_until_first_unanswered_low_prompt() {
+        let mut s = Singer::new();
+        s.discover(48);
+        s.confirm();
+        s.range.limit();
+        s.confirm(); // A#2
+        assert_eq!(s.range.target, Some(44));
+        assert_eq!(
+            s.range.reference_elapsed(6.0, s.time, true),
+            RangeEvent::Complete
+        );
+        assert_eq!(s.range.recommendation().map(|r| (r.0, r.1)), Some((46, 48)));
         assert!(!s.range.matched.contains(&44));
-        assert!(s
-            .range
-            .stage_message()
-            .contains(&format!("Lowest matched: {}", dsp::name(46))));
     }
     #[test]
     fn ordinary_misses_never_decide_an_upper_limit() {

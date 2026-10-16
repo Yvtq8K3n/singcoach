@@ -1,5 +1,6 @@
 mod audio;
 mod dsp;
+mod melody;
 mod monitor;
 mod piano;
 mod range;

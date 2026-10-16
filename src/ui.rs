@@ -32,7 +32,43 @@ struct Guide {
     texture: Option<egui::TextureHandle>,
     texture_key: Option<(usize, f32, f32, f32)>,
     frames: Vec<Frame>,
+    voice: Vec<Frame>,
+    voice_start: Option<f64>,
     pending: Option<std::sync::mpsc::Receiver<Vec<Frame>>>,
+}
+impl Guide {
+    fn trim_voice_end(&mut self) {
+        let keep = self
+            .voice
+            .iter()
+            .rposition(crate::melody::reliable)
+            .map_or(0, |i| i + 1);
+        self.voice.truncate(keep);
+        self.texture_key = None;
+    }
+    fn review_frames(&self, singing: bool) -> &[Frame] {
+        if singing {
+            &self.voice
+        } else {
+            &self.frames
+        }
+    }
+    fn review_label(&self, singing: bool) -> String {
+        if !singing {
+            return self.label.clone();
+        }
+        let pitches: Vec<_> = self
+            .voice
+            .iter()
+            .filter(|f| crate::melody::reliable(f))
+            .map(|f| dsp::midi(f.hz.unwrap()))
+            .collect();
+        if pitches.is_empty() {
+            "No voice".into()
+        } else {
+            dsp::name(training::median(&pitches).round() as i32)
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum InstructionIcon {
@@ -130,6 +166,7 @@ impl InstructionCard<'_> {
 }
 
 pub struct Coach {
+    melody: crate::melody::Coach,
     epoch: Instant,
     capture: Option<Capture>,
     player: Player,
@@ -150,10 +187,12 @@ pub struct Coach {
     seconds_back: f64,
     guides: Vec<Guide>,
     guide: Option<usize>,
+    review_singing: bool,
     sequence_start: usize,
     example: Option<Example>,
     range: Option<Range>,
     range_reference_ready_at: Option<f64>,
+    range_piano_finished: bool,
     range_input_after: f64,
     range_resume_at: Option<f64>,
     range_descending: bool,
@@ -179,6 +218,7 @@ impl Coach {
     }
     fn init(playback_only: bool) -> Self {
         let mut s = Self {
+            melody: crate::melody::Coach::default(),
             epoch: Instant::now(),
             capture: None,
             player: Player::new(),
@@ -199,10 +239,12 @@ impl Coach {
             seconds_back: 0.0,
             guides: Vec::new(),
             guide: None,
+            review_singing: false,
             sequence_start: 0,
             example: None,
             range: None,
             range_reference_ready_at: None,
+            range_piano_finished: false,
             range_input_after: 0.0,
             range_resume_at: None,
             range_descending: false,
@@ -224,6 +266,10 @@ impl Coach {
         self.epoch.elapsed().as_secs_f64()
     }
     fn start_capture(&mut self) {
+        if self.config.exercise == Exercise::Melody && self.range.is_none() {
+            self.stop_reference();
+            self.melody.reset();
+        }
         self.segmenter.clear();
         self.latest = None;
         self.capture_seen = self.now();
@@ -247,6 +293,12 @@ impl Coach {
         }
     }
     fn stop_capture(&mut self) {
+        if self.config.exercise == Exercise::Melody && self.range.is_none() {
+            self.stop_reference();
+            self.melody.fail(
+                "Microfone parado ou interrompido: dados insuficientes. Reinicia a captação.",
+            );
+        }
         self.capture = None;
         self.latest = None;
         self.segmenter.clear();
@@ -257,6 +309,8 @@ impl Coach {
         }
     }
     fn reset(&mut self) {
+        let was_playing = self.player.playing;
+        self.melody.reset();
         self.sequence_start = self.guides.len();
         self.guide = None;
         self.stop_reference();
@@ -264,9 +318,15 @@ impl Coach {
         self.attempts.clear();
         self.feedback = None;
         self.workflow = if self.capture.is_some() {
-            Workflow::AwaitQuiet {
-                since: None,
-                after: self.now(),
+            if was_playing {
+                Workflow::Cooldown {
+                    until: self.now() + 1.0,
+                }
+            } else {
+                Workflow::AwaitQuiet {
+                    since: None,
+                    after: self.now(),
+                }
             }
         } else {
             Workflow::Stopped
@@ -286,6 +346,17 @@ impl Coach {
     }
     fn begin_example(&mut self) {
         self.stop_reference();
+        if self.config.exercise == Exercise::Melody {
+            self.melody.prepare_reference();
+            match self.player.melody(&self.melody.sequence()) {
+                Ok(()) => {
+                    self.melody.state = crate::melody::State::Playback;
+                    self.workflow = Workflow::Reference;
+                }
+                Err(e) => self.melody.fail(&e),
+            }
+            return;
+        }
         let second = if self.config.exercise == Exercise::Transition {
             Some(self.config.target + self.config.interval)
         } else {
@@ -350,6 +421,8 @@ impl Coach {
                 .map(|s| format!("{} → {}", dsp::name(note), dsp::name(s)))
                 .unwrap_or(dsp::name(note)),
             frames: Vec::new(),
+            voice: Vec::new(),
+            voice_start: None,
             pending: Some(receiver),
         });
         if self.guides.len() > 24 {
@@ -359,18 +432,25 @@ impl Coach {
         self.guide = None;
     }
     fn start_range(&mut self) {
+        self.melody.reset();
         let tail = if self.player.playing { 0.5 } else { 0.0 };
         self.sequence_start = self.guides.len();
         self.guide = None;
         self.stop_reference();
         self.segmenter.clear();
         self.range_reference_ready_at = None;
+        self.range_piano_finished = false;
         self.range_input_after = self.now() + tail;
         self.range_resume_at = None;
         self.range_descending = false;
         self.range = Some(Range::new());
+        self.review_singing = true;
     }
     fn range_reference(&mut self) {
+        if let Some(g) = self.guides.last_mut() {
+            g.trim_voice_end();
+        }
+        self.range_piano_finished = false;
         self.segmenter.clear();
         self.range_resume_at = None;
         self.range_reference_ready_at = None;
@@ -395,11 +475,41 @@ impl Coach {
         if self.range_resume_at.is_some() || f.time < self.range_input_after {
             return;
         }
-        let ready = self.player.playing
-            && self.player.ready
+        // A deliberately silenced, already matched hold keeps microphone
+        // tracking. It cannot qualify any new match without playback readiness.
+        let ready = ((self.player.playing && self.player.ready)
+            || (self.range_piano_finished
+                && self.range.as_ref().is_some_and(Range::holding_match)))
             && self.range_reference_ready_at.is_some_and(|t| f.time >= t);
         if let Some(range) = &mut self.range {
+            let was_holding = range.holding_match();
             let event = range.observe_guided(f, ready, self.range_reference_ready_at);
+            if let Some(g) = self.guides.last_mut() {
+                if range.holding_match() && g.voice.len() < 1600 {
+                    // Retain only the confirmed hold, never its approach slide.
+                    let start = *g.voice_start.get_or_insert(f.time);
+                    let mut copy = f.clone();
+                    copy.time -= start;
+                    g.voice.push(copy);
+                    g.texture_key = None;
+                } else if was_holding && !range.holding_match() {
+                    g.trim_voice_end();
+                }
+            }
+            self.range_event(event);
+        }
+    }
+    fn poll_range_reference(&mut self, now: f64) {
+        if self.range_resume_at.is_some() {
+            return;
+        }
+        if let (Some(range), Some(start)) = (&mut self.range, self.range_reference_ready_at) {
+            let ready = (self.player.playing && self.player.ready) || self.range_piano_finished;
+            if ready && now - start >= 6.0 && !self.range_piano_finished {
+                self.player.stop();
+                self.range_piano_finished = true;
+            }
+            let event = range.reference_elapsed(now - start, now, ready);
             self.range_event(event);
         }
     }
@@ -424,6 +534,9 @@ impl Coach {
         }
     }
     fn finish_range(&mut self) {
+        if let Some(g) = self.guides.last_mut() {
+            g.trim_voice_end();
+        }
         self.range_resume_at = None;
         if let Some(r) = self.range.take() {
             if let Some(result) = r.recommendation() {
@@ -448,6 +561,9 @@ impl Coach {
         }
         self.player.poll();
         if let Some(error) = self.player.error.take() {
+            if self.config.exercise == Exercise::Melody && self.range.is_none() {
+                self.melody.fail(&error);
+            }
             self.error = Some(error);
             self.example = None;
             self.segmenter.clear();
@@ -465,7 +581,7 @@ impl Coach {
         if self.range_resume_at.is_some_and(|until| now >= until) {
             self.range_reference();
         }
-        if !self.player.playing || !self.player.ready {
+        if (!self.player.playing || !self.player.ready) && !self.range_piano_finished {
             self.range_reference_ready_at = None;
         }
         if self.range.is_some()
@@ -509,6 +625,9 @@ impl Coach {
                 self.observe_range_frame(&f);
                 continue;
             }
+            if self.config.exercise == Exercise::Melody {
+                self.observe_melody_frame(&f);
+            }
             match &mut self.workflow {
                 Workflow::Cooldown { until } if f.time >= *until => {
                     self.workflow = Workflow::AwaitQuiet {
@@ -517,10 +636,15 @@ impl Coach {
                     };
                 }
                 Workflow::AwaitQuiet { since, after } => {
-                    if f.time >= *after && f.rms < 0.008 {
+                    if f.time >= *after
+                        && f.rms < 0.008
+                        && (self.config.exercise != Exercise::Melody || !f.clipped)
+                    {
                         let start = *since.get_or_insert(f.time);
                         if f.time - start >= 0.25 {
-                            self.workflow = if self.attempts.len() >= 5 {
+                            self.workflow = if self.config.exercise != Exercise::Melody
+                                && self.attempts.len() >= 5
+                            {
                                 Workflow::Complete
                             } else {
                                 Workflow::Listening
@@ -530,7 +654,7 @@ impl Coach {
                         *since = None;
                     }
                 }
-                Workflow::Listening => {
+                Workflow::Listening if self.config.exercise != Exercise::Melody => {
                     if let Some(segment) = self.segmenter.push(f) {
                         let result = training::evaluate(&segment, self.config);
                         if let Result::Measured(m) = &result {
@@ -545,6 +669,7 @@ impl Coach {
                 _ => {}
             }
         }
+        self.poll_melody(now);
         if let Some(range) = &mut self.range {
             let event = range.advance(now);
             let resting = range.resting(now);
@@ -555,12 +680,7 @@ impl Coach {
         }
         // Process queued matches first so a successful final attempt wins
         // over the unanswered-prompt timeout. Each new target resets readiness.
-        if self.range_resume_at.is_none() && self.player.playing && self.player.ready {
-            if let (Some(range), Some(start)) = (&mut self.range, self.range_reference_ready_at) {
-                let event = range.reference_elapsed(now - start, now, true);
-                self.range_event(event);
-            }
-        }
+        self.poll_range_reference(now);
         if self.example.is_some() && self.player.ready {
             let example = self.example.as_mut().unwrap();
             let start = *example.started.get_or_insert(now);
@@ -658,6 +778,22 @@ impl Coach {
         self.settings = open;
     }
     fn active_target(&self) -> Option<i32> {
+        if self.config.exercise == Exercise::Melody && self.range.is_none() {
+            let elapsed = match self.melody.state {
+                crate::melody::State::Recording { .. } => self.melody_elapsed(self.now()),
+                crate::melody::State::Playback => self
+                    .melody
+                    .playback_start
+                    .map_or(-1.0, |start| self.now() - start),
+                _ => -1.0,
+            };
+            return self
+                .melody
+                .notes()
+                .iter()
+                .find(|n| elapsed >= n.start && elapsed < n.start + n.duration)
+                .map(|n| n.midi);
+        }
         if let Some(range) = &self.range {
             return range.target;
         }
@@ -675,7 +811,27 @@ impl Coach {
         }
     }
     fn coaching_callout(&self, ui: &mut egui::Ui) {
-        let (icon, title, message, color) = if let Some(range) = &self.range {
+        let (icon, title, message, color) = if self.config.exercise == Exercise::Melody
+            && self.range.is_none()
+        {
+            use crate::melody::State;
+            let (title, detail) = match self.melody.state {
+                State::Playback => ("Listen", "Listen to the piano sequence.".into()),
+                State::Recording { .. } => (
+                    "Sing",
+                    self.active_target()
+                        .map_or_else(|| "Follow the melody".into(), dsp::name),
+                ),
+                State::Results => ("Review", "See the note results below.".into()),
+                State::Error => ("Check input", "Restart capture and try again.".into()),
+                State::Ready => (
+                    "Sing",
+                    "Start when ready · your voice starts the timeline.".into(),
+                ),
+                _ => ("Ready", "Sing to start, or press play for piano.".into()),
+            };
+            (InstructionIcon::Hold, title, detail, BLUE)
+        } else if let Some(range) = &self.range {
             let (icon, title) = match range.phase {
                 RangePhase::Baseline => (InstructionIcon::Hold, "Sing an easy note"),
                 RangePhase::ConfirmStart => (InstructionIcon::Hold, "Match this note"),
@@ -734,20 +890,15 @@ impl Coach {
                     BLUE
                 },
             )
-        } else if let Some((low, high, _)) = self.accepted {
+        } else if let Some((low, high, start)) = self.accepted {
             (
                 InstructionIcon::Done,
                 "Complete",
                 format!(
-                    "Highest: {} → lowest: {}. Well done!{}",
-                    dsp::name(high),
+                    "Try {} · target set\nMatched {}–{}",
+                    dsp::name(start),
                     dsp::name(low),
-                    self.accepted_sustain
-                        .map(|(note, seconds)| format!(
-                            "\nHighest sustain: {} · {seconds:.1}s",
-                            dsp::name(note)
-                        ))
-                        .unwrap_or_default()
+                    dsp::name(high)
                 ),
                 GREEN,
             )
@@ -853,7 +1004,8 @@ impl Coach {
                     );
                     ui.small(format!("Estimate: {}", crate::range::range_estimate(low, high)))
                         .on_hover_text("Rough range-only comparison, not a confirmed voice type. Based on your matched endpoints; comfortable range and tone are not assessed. Overlapping labels are alternatives, not multiple confirmed voice types.");
-                    ui.small(format!("Exercise starting note: {}", dsp::name(start)));
+                    ui.small(format!("Suggested practice note: {}", dsp::name(start)))
+                        .on_hover_text("A matched note nearest the middle of this check, automatically set as your exercise target. Comfort is yours to judge; choose another target if it feels easier.");
                     if let Some((note,seconds)) = self.accepted_sustain {
                         ui.small(format!("Highest sustain: {} · {seconds:.1}s",dsp::name(note)));
                     }
@@ -965,6 +1117,8 @@ impl Coach {
                 "Take a breath"
             } else if let Some(cue) = r.pacing_cue(self.now(), self.range_reference_ready_at) {
                 cue
+            } else if self.range_piano_finished {
+                "Piano finished · Replay note to retry"
             } else if !self.player.ready {
                 "Reference not ready"
             } else {
@@ -989,13 +1143,18 @@ impl Coach {
             }
         });
         ui.small(r.hint);
+        if self.range_piano_finished && r.holding_match() {
+            ui.small("Piano stopped after 3 runs · keep holding until you release.");
+        }
         if matches!(r.phase, RangePhase::Higher | RangePhase::UpperEdge) {
             ui.small(
                 "3 unanswered repetitions → lower; singing above baseline gets one extra set.",
             );
         }
         if matches!(r.phase, RangePhase::Lower | RangePhase::LowerEdge) {
-            ui.small("After 3 repetitions without a match, we finish with your matched notes.");
+            ui.small(
+                "3 unanswered runs: lower toward your start; below it, finish with matched notes.",
+            );
         }
         let phase = r.phase;
         ui.horizontal_wrapped(|ui| {
@@ -1047,12 +1206,27 @@ impl Coach {
     fn monitor(&mut self, ui: &mut egui::Ui, height: f32) {
         ui.strong(if self.range.is_some() {
             "Panel · Voice setup"
+        } else if self.config.exercise == Exercise::Melody {
+            "Panel · Melody + your voice"
+        } else if self.review_singing && !self.guides.is_empty() {
+            "Panel · Your singing + piano target"
         } else if self.guides.is_empty() {
             "Panel · Your voice"
         } else {
             "Panel · Your voice + example"
         });
         crate::monitor::tabs(ui, &mut self.view);
+        if self.config.exercise == Exercise::Melody && self.range.is_none() {
+            crate::monitor::melody_path(
+                ui,
+                &self.melody,
+                self.now(),
+                height,
+                self.view,
+                self.latest.as_ref(),
+            );
+            return;
+        }
         let latest = self
             .history
             .back()
@@ -1102,11 +1276,17 @@ impl Coach {
             self.guides.iter().collect()
         } else if let Some(index) = self.guide {
             self.guides.get(index).into_iter().collect()
-        } else if self.view != View::Spectrum
-            && self.range.is_none()
-            && self.config.exercise == Exercise::Transition
+        } else if self.review_singing
+            || (self.view != View::Spectrum
+                && self.range.is_none()
+                && self.config.exercise == Exercise::Transition)
         {
-            self.guides.last().into_iter().collect()
+            self.guides
+                .iter()
+                .rev()
+                .find(|g| !self.review_singing || !g.voice.is_empty())
+                .into_iter()
+                .collect()
         } else {
             let current = &self.guides[self.sequence_start.min(self.guides.len())..];
             if current.is_empty() {
@@ -1115,6 +1295,10 @@ impl Coach {
                 current.iter().collect()
             }
         };
+        let selected: Vec<_> = selected
+            .into_iter()
+            .filter(|g| !self.review_singing || !g.voice.is_empty())
+            .collect();
         if self.view == View::Spectrum {
             egui::CollapsingHeader::new("Zoom and clarity").show(ui, |ui| {
                 ui.add(
@@ -1152,7 +1336,7 @@ impl Coach {
             let mut sequence = Vec::new();
             for (index, g) in selected.iter().enumerate() {
                 for f in g
-                    .frames
+                    .review_frames(self.review_singing)
                     .iter()
                     .filter(|f| f.time < window && f.spectrum.is_some())
                 {
@@ -1165,7 +1349,9 @@ impl Coach {
             let seconds = (selected.len() as f64 * window
                 + selected.len().saturating_sub(1) as f64 * 0.06)
                 .max(window);
-            let label = if selected.len() > 1 {
+            let label = if self.review_singing {
+                format!("Captured singing · {} clips", selected.len())
+            } else if selected.len() > 1 {
                 format!("Examples · {} notes · pinned", selected.len())
             } else {
                 format!(
@@ -1177,7 +1363,11 @@ impl Coach {
             let gain = self.spectrum_gain;
             if ui.available_width() >= 680.0 {
                 ui.columns(2, |cols| {
-                    cols[0].label(RichText::new(&label).color(PURPLE).strong());
+                    cols[0].label(
+                        RichText::new(&label)
+                            .color(if self.review_singing { BLUE } else { PURPLE })
+                            .strong(),
+                    );
                     crate::monitor::spectrum(
                         &mut cols[0],
                         &reference,
@@ -1185,7 +1375,7 @@ impl Coach {
                         height,
                         bounds,
                         gain,
-                        true,
+                        !self.review_singing,
                     );
                     cols[1].label(RichText::new("Your voice").color(BLUE).strong());
                     crate::monitor::spectrum(
@@ -1199,7 +1389,11 @@ impl Coach {
                     );
                 });
             } else {
-                ui.label(RichText::new(label).color(PURPLE).strong());
+                ui.label(
+                    RichText::new(label)
+                        .color(if self.review_singing { BLUE } else { PURPLE })
+                        .strong(),
+                );
                 crate::monitor::spectrum(
                     ui,
                     &reference,
@@ -1207,7 +1401,7 @@ impl Coach {
                     height * 0.5,
                     bounds,
                     gain,
-                    true,
+                    !self.review_singing,
                 );
                 ui.label(RichText::new("Your voice").color(BLUE).strong());
                 crate::monitor::spectrum(
@@ -1223,39 +1417,77 @@ impl Coach {
             ui.small(format!("Voice: {window:.2}s · references: {seconds:.2}s · {:.0}–{:.0} Hz · gain +{gain:.0} dB",bounds.0,bounds.1));
             ui.small("Stop to review · hover for measurements");
         } else {
+            let live_singing = self.review_singing
+                && self.range.is_some()
+                && self.view == View::Compact
+                && self.guide.is_none();
             let voice: VecDeque<_> = self
                 .history
                 .iter()
                 .filter(|f| f.time >= end - 3.0 && f.time <= end)
                 .cloned()
                 .collect();
-            let clips: Vec<_> = selected.iter().map(|g| g.frames.as_slice()).collect();
-            let pinned = if self.view == View::Full {
+            let clips: Vec<_> = selected
+                .iter()
+                .map(|g| g.review_frames(self.review_singing))
+                .collect();
+            let pinned = if self.view == View::Full || self.review_singing {
                 crate::monitor::overview_pitch(&clips, end)
             } else {
                 crate::monitor::pinned_pitch(&clips, end)
             };
-            crate::monitor::pitch_monitor(
+            let mut indicators = Vec::new();
+            if self.review_singing && !live_singing {
+                let slot = 3.0 / selected.len().max(1) as f64;
+                for (i, g) in selected.iter().enumerate() {
+                    if let (Some(first), Some(last)) = (g.voice.first(), g.voice.last()) {
+                        let start = end - 3.0 + i as f64 * slot;
+                        indicators.push(crate::monitor::PitchGuide {
+                            note: g.note,
+                            start,
+                            end: start
+                                + (last.time - first.time) / (last.time - first.time + 0.05)
+                                    * slot
+                                    * 0.92,
+                        });
+                    }
+                }
+            }
+            let empty = VecDeque::new();
+            crate::monitor::pitch_monitor_guided(
                 ui,
-                &voice,
-                &pinned,
-                self.active_target()
-                    .map(|note| crate::monitor::PitchTarget {
-                        note,
-                        tolerance_cents: if self.range.is_some() {
-                            crate::range::MATCH_CENTS
-                        } else {
-                            15.0
-                        },
-                    }),
+                if self.review_singing && !live_singing {
+                    &pinned
+                } else {
+                    &voice
+                },
+                if self.review_singing { &empty } else { &pinned },
+                (
+                    self.active_target()
+                        .map(|note| crate::monitor::PitchTarget {
+                            note,
+                            tolerance_cents: if self.range.is_some() {
+                                crate::range::MATCH_CENTS
+                            } else {
+                                15.0
+                            },
+                        }),
+                    &indicators,
+                ),
                 self.view == View::Full,
                 height,
                 end,
             );
-            ui.small(if self.active_target().is_none(){"Blue = your voice · hold an easy note to start · the piano joins afterward"}else{"Green = target · blue = microphone · purple = pinned example · session history retained"});
+            ui.small(if live_singing {
+                "Blue = your live voice · green = target · click a thumbnail to review"
+            } else if self.review_singing {
+                "Blue = captured singing · faint purple = guide note only"
+            } else {
+                "Blue = microphone · purple = piano reference · green = target"
+            });
             if height >= 180.0 {
                 ui.small(if self.view == View::Full {
-                    "Full scale: C2–C6 · all saved guides fitted together · blue voice is live"
+                    "Full scale: C2–C6 · saved clips fitted together for review"
                 } else {
                     "Compact hides notes between distant ranges · hover the gap label for distance"
                 });
@@ -1263,14 +1495,14 @@ impl Coach {
         }
     }
     fn reference_history_ui(&mut self, ui: &mut egui::Ui) {
-        if self.guides.len() < 2 {
+        if self.guides.is_empty() {
             return;
         }
         ui.horizontal(|ui| {
-            ui.small(if self.view == View::Full {
-                "Saved guides · all shown · click for Compact review"
+            ui.small(if self.review_singing {
+                "Saved singing · faint purple = guide note"
             } else {
-                "Saved guides · click a note to review it"
+                "Saved guides · voice + piano reference"
             });
             if self.guide.is_some() && ui.small_button("All notes").clicked() {
                 self.guide = None;
@@ -1280,25 +1512,34 @@ impl Coach {
         let gain = self.spectrum_gain;
         let low = self.spectrum_low;
         let high = self.spectrum_high;
-        let selected = self.guide.unwrap_or(self.guides.len() - 1);
+        let selected = self.guide.unwrap_or_else(|| {
+            self.guides
+                .iter()
+                .rposition(|g| !self.review_singing || !g.voice.is_empty())
+                .unwrap_or(0)
+        });
+        let singing = self.review_singing;
         egui::ScrollArea::horizontal()
             .id_salt("saved_guides")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (index, g) in self.guides.iter_mut().enumerate() {
+                    for (order, (index, g)) in self.guides.iter_mut().enumerate()
+                        .filter(|(_, g)| !singing || !g.voice.is_empty()).enumerate() {
                         let (rect, response) =
                             ui.allocate_exact_size(Vec2::new(96.0, 58.0), egui::Sense::click());
                         response.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::WidgetType::Button,
                                 true,
-                                format!("Review {}", g.label),
+                                format!("Review {}", g.review_label(singing)),
                             )
                         });
                         if ui.is_rect_visible(rect) {
                             let p = ui.painter_at(rect);
+                            let frames = if singing { &g.voice } else { &g.frames };
+                            let color = if singing { BLUE } else { PURPLE };
                             let ink = if self.view == View::Full || index == selected {
-                                PURPLE
+                                color
                             } else {
                                 Color32::GRAY
                             };
@@ -1306,7 +1547,7 @@ impl Coach {
                             p.text(
                                 Pos2::new(rect.center().x, rect.top() + 9.0),
                                 egui::Align2::CENTER_CENTER,
-                                format!("{} · {}", index + 1, g.label),
+                                format!("{} · {}", order + 1, g.review_label(singing)),
                                 egui::FontId::proportional(11.0),
                                 ink,
                             );
@@ -1315,17 +1556,16 @@ impl Coach {
                                 rect.max - Vec2::new(5.0, 5.0),
                             );
                             if spectrum {
-                                let key = (g.frames.len(), low, high, gain);
+                                let key = (frames.len(), low, high, gain);
                                 if g.texture_key != Some(key) {
                                     let mut pixels = egui::ColorImage::new(
                                         [96, 32],
                                         crate::monitor::spectral_color(-120.0, gain),
                                     );
-                                    let duration = g.frames.last().map_or(1.0, |f| f.time + 0.05);
+                                    let duration = frames.last().map_or(1.0, |f| f.time + 0.05);
                                     for x in 0..96 {
                                         let t = x as f64 / 96.0 * duration;
-                                        if let Some(bins) = g
-                                            .frames
+                                        if let Some(bins) = frames
                                             .iter()
                                             .filter(|f| f.spectrum.is_some())
                                             .min_by(|a, b| {
@@ -1370,17 +1610,18 @@ impl Coach {
                                 }
                             } else {
                                 let mut previous: Option<(Pos2, f64)> = None;
-                                let duration = g.frames.last().map_or(1.0, |f| f.time + 0.05);
-                                let notes: Vec<_> = g
-                                    .frames
-                                    .iter()
-                                    .filter_map(|f| f.hz.map(dsp::midi))
-                                    .collect();
+                                let duration = frames.last().map_or(1.0, |f| f.time + 0.05);
+                                let notes: Vec<_> =
+                                    frames.iter().filter(|f| crate::melody::reliable(f)).filter_map(|f| f.hz.map(dsp::midi)).collect();
                                 let bottom =
                                     notes.iter().copied().fold(g.note as f32, f32::min) - 0.5;
                                 let top = notes.iter().copied().fold(g.note as f32, f32::max) + 0.5;
-                                for f in &g.frames {
-                                    if let Some(hz) = f.hz.filter(|_| f.confidence >= 0.85) {
+                                if singing && !frames.is_empty() {
+                                    let target_y = egui::lerp(plot.bottom()..=plot.top(), (g.note as f32 - bottom) / (top - bottom));
+                                    p.line_segment([Pos2::new(plot.left(), target_y), Pos2::new(plot.right(), target_y)], Stroke::new(1.5_f32, PURPLE.gamma_multiply(0.65)));
+                                }
+                                for f in frames {
+                                    if let Some(hz) = f.hz.filter(|_| crate::melody::reliable(f)) {
                                         let point = Pos2::new(
                                             plot.left() + (f.time / duration) as f32 * plot.width(),
                                             egui::lerp(
@@ -1389,7 +1630,10 @@ impl Coach {
                                             ),
                                         );
                                         if let Some((prev, t)) = previous {
-                                            if f.time - t < 0.025 {
+                                            if f.time - t > 0.0
+                                                && f.time - t < 0.025
+                                                && (point.y - prev.y).abs() <= 2.0 / (top - bottom) * plot.height()
+                                            {
                                                 p.line_segment(
                                                     [prev, point],
                                                     Stroke::new(1.5_f32, ink),
@@ -1405,10 +1649,15 @@ impl Coach {
                             if self.view == View::Full || index == selected {
                                 p.line_segment(
                                     [rect.left_bottom(), rect.right_bottom()],
-                                    Stroke::new(2.0_f32, PURPLE),
+                                    Stroke::new(2.0_f32, color),
                                 );
                             }
                         }
+                        let response = response.on_hover_text(if singing {
+                            format!("Captured microphone · median reliable note: {} · piano target: {}. No voice means no reliable captured pitch.", g.review_label(true), g.label)
+                        } else {
+                            format!("Piano reference: {} · this is not evidence of singing.", g.label)
+                        });
                         if response.clicked() {
                             if self.view == View::Full {
                                 self.view = View::Compact;
@@ -1423,10 +1672,10 @@ impl Coach {
         let before = self.config;
         egui::ComboBox::from_id_salt("exercise")
             .width(220.0)
-            .selected_text(if self.config.exercise == Exercise::Attack {
-                "Clean attacks (ah)"
-            } else {
-                "Note transitions (ah)"
+            .selected_text(match self.config.exercise {
+                Exercise::Attack => "Clean attacks (ah)",
+                Exercise::Transition => "Note transitions (ah)",
+                Exercise::Melody => "Melody Coach",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(
@@ -1439,7 +1688,17 @@ impl Coach {
                     Exercise::Transition,
                     "Note transitions (ah)",
                 );
+                ui.selectable_value(&mut self.config.exercise, Exercise::Melody, "Melody Coach");
             });
+        if self.config.exercise != before.exercise {
+            let selected = self.config.exercise;
+            self.config.exercise = before.exercise;
+            self.change_exercise(selected);
+        }
+        if self.config.exercise == Exercise::Melody {
+            self.melody_controls_ui(ui);
+            return;
+        }
         ui.horizontal(|ui|{
             let text_width=(ui.available_width()-48.0).max(80.0);
             ui.vertical(|ui|{
@@ -1502,7 +1761,7 @@ impl Coach {
                 );
             }
         });
-        if self.config != before {
+        if self.config != before && self.config.exercise == before.exercise {
             self.reset();
             if self.config.exercise == Exercise::Transition {
                 self.spectrum_secs = 1.75;
@@ -1541,6 +1800,10 @@ impl Coach {
     }
     fn feedback_ui(&self, ui: &mut egui::Ui) {
         ui.strong("Feedback & measurements");
+        if self.config.exercise == Exercise::Melody {
+            self.melody_feedback_ui(ui);
+            return;
+        }
         let measured = match &self.feedback {
             Some(Result::Measured(m)) => Some(m),
             _ => None,
@@ -1621,11 +1884,222 @@ impl Coach {
             ));
         }
     }
+    fn change_exercise(&mut self, selected: Exercise) {
+        self.config.exercise = selected;
+        self.range = None;
+        self.reset();
+        if selected == Exercise::Melody {
+            self.view = View::Compact;
+        }
+        if selected == Exercise::Transition {
+            self.spectrum_secs = 1.75;
+        }
+    }
+    fn melody_elapsed(&self, fallback: f64) -> f64 {
+        match self.melody.state {
+            crate::melody::State::Recording { start } => self
+                .latest
+                .as_ref()
+                .map_or(fallback - start, |f| f.time - start)
+                .max(0.0),
+            _ => 0.0,
+        }
+    }
+    fn observe_melody_frame(&mut self, frame: &Frame) {
+        use crate::melody::State;
+        if self.config.exercise != Exercise::Melody || self.range.is_some() {
+            return;
+        }
+        if matches!(self.melody.state, State::Idle | State::Ready)
+            && matches!(self.workflow, Workflow::Listening)
+            && !self.player.playing
+            && crate::melody::reliable(frame)
+        {
+            // Voice-only starts use the first reliable captured frame as the
+            // attempt epoch, so that first note is retained at time zero.
+            self.melody.state = State::Recording { start: frame.time };
+        }
+        if !self.player.playing && matches!(self.workflow, Workflow::Listening) {
+            self.melody.push(frame);
+        }
+    }
+    fn poll_melody(&mut self, now: f64) {
+        use crate::melody::State;
+        if self.config.exercise != Exercise::Melody || self.range.is_some() {
+            return;
+        }
+        match self.melody.state {
+            State::Playback if self.player.ready => {
+                let start = *self.melody.playback_start.get_or_insert(now);
+                if now - start >= self.melody.duration() + 0.05 {
+                    self.stop_reference();
+                    self.melody.state = State::Ready;
+                    // Playback frames were drained before this transition.
+                    // Melody starts on subsequent voice, without a quiet gate.
+                    self.workflow = if self.capture.is_some() {
+                        Workflow::Listening
+                    } else {
+                        Workflow::Stopped
+                    };
+                }
+            }
+            State::Recording { .. } if self.melody_elapsed(now) >= self.melody.duration() + 0.3 => {
+                self.melody.finish();
+                self.workflow = if self.capture.is_some() {
+                    Workflow::AwaitQuiet {
+                        since: None,
+                        after: now,
+                    }
+                } else {
+                    Workflow::Stopped
+                };
+            }
+            _ => {}
+        }
+    }
+    fn melody_controls_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::melody::State;
+        let active = matches!(
+            self.melody.state,
+            State::Playback | State::Ready | State::Recording { .. }
+        );
+        let before = (self.melody.pattern, self.melody.transpose);
+        ui.add_enabled_ui(!active, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("melody_pattern")
+                    .selected_text(if self.melody.pattern == 0 {
+                        "Subida de cinco notas"
+                    } else {
+                        "Arpejo"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.melody.pattern, 0, "Subida de cinco notas");
+                        ui.selectable_value(&mut self.melody.pattern, 1, "Arpejo");
+                    });
+                let maximum = if self.melody.pattern == 0 { 31 } else { 29 };
+                self.melody.transpose = self.melody.transpose.min(maximum);
+                ui.add(
+                    egui::Slider::new(&mut self.melody.transpose, -12..=maximum)
+                        .text("Transposição"),
+                );
+            });
+        });
+        if before != (self.melody.pattern, self.melody.transpose) {
+            self.stop_reference();
+            self.melody.reset_variation();
+        }
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 48.0).max(80.0));
+                ui.label("Listen to the piano, then sing when ready. Or sing to start directly. Use headphones.");
+                ui.small(format!("Sequence {} / 4 · sing to start · Play gives the next", self.melody.variation + 1));
+            });
+            ui.add_enabled_ui(!active || self.melody.state == State::Playback, |ui| {
+                if crate::monitor::play_button(ui, self.melody.state == State::Playback).clicked() {
+                    if self.melody.state == State::Playback {
+                        self.stop_reference();
+                        self.melody.state = State::Idle;
+                    } else {
+                        self.begin_example();
+                    }
+                }
+            });
+        });
+        if ui
+            .add_enabled(active, egui::Button::new("Stop attempt"))
+            .clicked()
+        {
+            self.stop_reference();
+            if matches!(self.melody.state, State::Recording { .. }) {
+                self.melody.finish();
+            } else {
+                self.melody.state = State::Idle;
+            }
+        }
+        let status = match self.melody.state {
+            State::Idle => "Ready · sing to start when Listening, or press play".into(),
+            State::Ready => "Sing when ready · your voice starts the timeline".into(),
+            State::Playback => if self.player.ready {
+                "A ouvir referência"
+            } else {
+                "A preparar áudio"
+            }
+            .into(),
+            State::Recording { .. } => format!(
+                "Canta · {:.1} / {:.1}s",
+                self.melody_elapsed(self.now()),
+                self.melody.duration()
+            ),
+            State::Analyzing => "A analisar".into(),
+            State::Results => "Resultado · podes repetir".into(),
+            State::Error => "Erro · dados insuficientes".into(),
+        };
+        ui.strong(status);
+        if let Some(e) = &self.melody.error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        ui.add_enabled_ui(!active && self.melody.result.is_none(), |ui| {
+            ui.collapsing("Tolerâncias de avaliação", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.melody.tolerance, 15.0..=90.0)
+                        .text("Afinação ± cents"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.melody.minimum_coverage, 0.5..=0.9)
+                        .text("Cobertura mínima"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.melody.margin, 0.05..=0.2)
+                        .text("Margem por limite (s)"),
+                );
+            });
+        });
+        if ui.small_button("New drill").clicked() {
+            self.reset();
+        }
+    }
+    fn melody_feedback_ui(&self, ui: &mut egui::Ui) {
+        use crate::melody;
+        if self.melody.result.is_none() {
+            ui.label("Sing the melody to see feedback here.");
+        }
+        if let Some(r) = &self.melody.result {
+            ui.heading(r.score.map_or_else(
+                || "Score: — · insufficient data".into(),
+                |score| format!("Score: {score:.0} / 100"),
+            ));
+            ui.small("Score = percentage of the full melody sung in tune.");
+            ui.strong(&r.feedback);
+            ui.label(format!(
+                "Cobertura vocal fiável: {:.0}%",
+                r.coverage * 100.0
+            ));
+            ui.label(format!(
+                "Tempo afinado (melodia completa): {} · nota mais difícil: {}",
+                melody::metric(r.score, "%"),
+                r.hardest.map_or_else(
+                    || "—".into(),
+                    |i| format!("{} ({})", i + 1, dsp::name(self.melody.notes()[i].midi))
+                )
+            ));
+            for (i, a) in r.notes.iter().enumerate() {
+                ui.small(format!(
+                    "{} · {} · cobertura {:.0}% · viés {} · erro absoluto {} · voz afinada {}",
+                    i + 1,
+                    dsp::name(self.melody.notes()[i].midi),
+                    a.coverage * 100.0,
+                    melody::metric(a.bias, "¢"),
+                    melody::metric(a.absolute, "¢"),
+                    melody::metric(a.in_tune.map(|v| v * 100.0), "%")
+                ));
+            }
+        }
+    }
     fn render(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| self.header(ui));
         egui::CentralPanel::default().show(ctx,|ui|{
             let available=ui.available_height();
-            let id=ui.id().with(("monitor_layout",self.view as u8,ui.available_width().round() as i32));
+            let id=ui.id().with(("monitor_layout",self.config.exercise as u8,self.view as u8,ui.available_width().round() as i32));
             let overhead=ctx.data(|data|data.get_temp::<f32>(id)).unwrap_or(320.0);
             let minimum=if self.view==View::Spectrum{120.0}else{160.0};
             let height=(available-overhead).max(minimum);
@@ -1633,7 +2107,7 @@ impl Coach {
                 let top=ui.cursor().top();self.monitor(ui,height);ui.add_space(6.0);ui.separator();ui.add_space(6.0);
                 if self.range.is_some(){ui.label("Exercise paused while you find your note — follow the voice check above.");}
                 else{
-                    ui.horizontal(|ui|{ui.heading("Exercise");ui.label(if self.config.exercise==Exercise::Attack{"Start directly on one note"}else{"Move cleanly between two notes"});});
+                    ui.horizontal(|ui|{ui.heading("Exercise");ui.label(match self.config.exercise {Exercise::Attack=>"Start directly on one note",Exercise::Transition=>"Move cleanly between two notes",Exercise::Melody=>"Follow a short melody"});});
                     ui.add_space(6.0);
                     if ui.available_width()>=680.0{ui.columns(2,|columns|{columns[0].group(|ui|self.exercise_ui(ui));columns[1].group(|ui|self.feedback_ui(ui));});}
                     else{ui.group(|ui|self.exercise_ui(ui));ui.add_space(8.0);ui.group(|ui|self.feedback_ui(ui));}
@@ -1724,6 +2198,249 @@ mod tests {
             .unwrap_or_else(|| panic!("Missing {label}"))
     }
     #[test]
+    fn melody_exercise_uses_shared_layout_and_safe_lifecycle() {
+        use crate::melody::State;
+        for size in [[960.0, 760.0], [720.0, 640.0]] {
+            let mut c = Coach::init(true);
+            c.change_exercise(Exercise::Melody);
+            let config = c.config;
+            for state in [
+                State::Idle,
+                State::Playback,
+                State::Recording { start: 0.0 },
+                State::Results,
+                State::Error,
+            ] {
+                c.melody.state = state;
+                if state == State::Results {
+                    c.melody.finish();
+                }
+                let output = render_frames(&mut c, size);
+                for label in [
+                    "Listen to the piano",
+                    "Stop attempt",
+                    "Azul tracejado",
+                    "Melody Coach",
+                    "Feedback & measurements",
+                    "New drill",
+                    "Compact",
+                    "Full scale",
+                    "Spectrogram",
+                ] {
+                    let rect = text_bounds(&output, label);
+                    assert!(
+                        rect.right() <= size[0] && rect.bottom() <= size[1],
+                        "{label}: {rect:?}"
+                    );
+                }
+                assert_eq!(c.config, config);
+                assert!(c.attempts.is_empty());
+            }
+            for view in [View::Compact, View::Full, View::Spectrum] {
+                c.view = view;
+                let output = render_frames(&mut c, size);
+                let path = text_bounds(&output, "Purple: piano path");
+                assert!(path.right() <= size[0] && path.bottom() <= size[1]);
+                assert_eq!(c.config, config);
+            }
+            c.melody.state = State::Recording { start: 10.0 };
+            c.poll_melody(17.0);
+            assert_eq!(c.melody.state, State::Results);
+            assert!(c.melody.result.as_ref().unwrap().score.is_none());
+            c.change_exercise(Exercise::Attack);
+            assert_eq!(c.melody.state, State::Idle);
+            assert!(!c.player.playing && c.melody.result.is_none());
+            c.change_exercise(Exercise::Melody);
+            c.stop_capture();
+            assert_eq!(c.melody.state, State::Error);
+            assert!(!c.player.playing);
+            c.melody.reset();
+            c.melody.transpose = 5;
+            assert_eq!(c.melody.notes()[0].midi, 53);
+            c.start_range();
+            assert!(c.range.is_some());
+            assert_eq!(c.melody.state, State::Idle);
+            assert_eq!(c.config, config);
+            assert!(c.attempts.is_empty());
+        }
+    }
+    #[test]
+    fn melody_capture_clock_aligns_voice_start_trace_and_completion() {
+        use crate::melody::State;
+        let mut c = Coach::init(true);
+        c.change_exercise(Exercise::Melody);
+        c.workflow = Workflow::Listening;
+        c.capture_seen = 10.0;
+        c.latest = Some(Frame {
+            time: 11.6,
+            hz: Some(dsp::hz(48.0)),
+            confidence: 0.99,
+            rms: 0.1,
+            clipped: false,
+            spectrum: None,
+        });
+        c.melody.state = State::Ready;
+        c.poll_melody(10.0);
+        assert_eq!(c.melody.state, State::Ready);
+        let mut f = c.latest.clone().unwrap();
+        c.observe_melody_frame(&f);
+        assert_eq!(c.melody.state, State::Recording { start: 11.6 });
+        assert_eq!(c.melody.frames[0].time, 0.0);
+        f.time += 2.8;
+        c.latest = Some(f.clone());
+        c.observe_melody_frame(&f);
+        assert!((c.melody_elapsed(12.8) - 2.8).abs() < 1e-6);
+        assert!((c.melody.frames.last().unwrap().time - 2.8).abs() < 1e-6);
+        c.poll_melody(16.4); // Wall time cannot end an unfinished capture timeline.
+        assert!(matches!(c.melody.state, State::Recording { .. }));
+        c.latest.as_mut().unwrap().time = 18.0;
+        c.poll_melody(16.4);
+        assert_eq!(c.melody.state, State::Results);
+    }
+    #[test]
+    fn melody_voice_start_records_first_c3_and_respects_playback_gates() {
+        use crate::melody::State;
+        let mut c = Coach::init(true);
+        c.change_exercise(Exercise::Melody);
+        let mut f = Frame {
+            time: 10.0,
+            hz: Some(dsp::hz(48.0)),
+            confidence: 0.99,
+            rms: 0.1,
+            clipped: false,
+            spectrum: None,
+        };
+        for workflow in [
+            Workflow::Stopped,
+            Workflow::Reference,
+            Workflow::Cooldown { until: 11.0 },
+            Workflow::AwaitQuiet {
+                since: None,
+                after: 9.0,
+            },
+        ] {
+            c.workflow = workflow;
+            c.observe_melody_frame(&f);
+            assert_eq!(c.melody.state, State::Idle);
+            assert!(c.melody.frames.is_empty());
+        }
+        c.workflow = Workflow::Listening;
+        c.player.playing = true;
+        c.observe_melody_frame(&f);
+        assert_eq!(c.melody.state, State::Idle);
+        c.player.playing = false;
+        for (confidence, clipped, rms) in [(0.2, false, 0.1), (0.99, true, 0.1), (0.99, false, 0.0)]
+        {
+            f.confidence = confidence;
+            f.clipped = clipped;
+            f.rms = rms;
+            c.observe_melody_frame(&f);
+            assert_eq!(c.melody.state, State::Idle);
+        }
+        f.confidence = 0.99;
+        f.rms = 0.1;
+        c.observe_melody_frame(&f);
+        assert_eq!(c.melody.state, State::Recording { start: 10.0 });
+        assert_eq!(c.melody.frames.len(), 1);
+        assert_eq!(c.melody.frames[0].time, 0.0);
+        assert_eq!(c.melody.frames[0].hz, f.hz);
+        f.time = 10.01;
+        c.observe_melody_frame(&f);
+        assert!((c.melody.frames[1].time - 0.01).abs() < 1e-6);
+        c.melody.finish();
+        c.observe_melody_frame(&f);
+        assert_eq!(c.melody.state, State::Results);
+        assert!(c.attempts.is_empty());
+    }
+    #[test]
+    fn melody_shows_live_c3_outside_an_attempt_without_scoring_it() {
+        let mut c = Coach::init(true);
+        c.change_exercise(Exercise::Melody);
+        c.melody.transpose = 12; // C3 is below this melody's default chart bounds.
+        for view in [View::Compact, View::Full, View::Spectrum] {
+            c.view = view;
+            c.latest = Some(Frame {
+                time: c.now(),
+                hz: Some(dsp::hz(48.0)),
+                confidence: 0.99,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            });
+            let output = render_frames(&mut c, [960.0, 760.0]);
+            let live = text_bounds(&output, "Live C3");
+            assert!(live.is_positive() && live.right() <= 960.0 && live.bottom() <= 760.0);
+            assert!(c.melody.frames.is_empty() && c.melody.result.is_none());
+        }
+        c.latest.as_mut().unwrap().time = c.now() - 1.0;
+        let output = render_frames(&mut c, [960.0, 760.0]);
+        assert!(!output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text().contains("Live C3")
+        )));
+    }
+    #[test]
+    fn changing_exercise_cancels_melody_and_keeps_evidence_separate() {
+        use crate::melody::State;
+        let mut c = Coach::init(true);
+        c.change_exercise(Exercise::Melody);
+        for state in [
+            State::Playback,
+            State::Recording { start: 10.0 },
+            State::Results,
+        ] {
+            c.melody.state = state;
+            let f = Frame {
+                time: 10.1,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 0.99,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            };
+            c.history.push_back(f.clone());
+            c.melody.frames.push(f);
+            c.player.playing = true; // Pending playback, without opening hardware.
+            c.player.ready = true;
+            c.change_exercise(Exercise::Transition);
+            assert!(!c.player.playing && !c.player.ready);
+            assert!(c.melody.frames.is_empty() && c.melody.result.is_none());
+            assert!(c.segmenter.started_at().is_none());
+            assert!(c.attempts.is_empty() && c.feedback.is_none());
+            assert!(!c.history.is_empty());
+            c.change_exercise(Exercise::Melody);
+        }
+        c.melody.state = State::Playback;
+        c.player.ready = false;
+        c.poll_melody(100.0);
+        assert!(c.melody.playback_start.is_none());
+        c.player.ready = true;
+        c.poll_melody(101.0);
+        assert_eq!(c.melody.playback_start, Some(101.0));
+        c.poll_melody(108.0);
+        assert_eq!(c.melody.state, State::Ready);
+        assert!(!c.player.playing);
+        c.poll_melody(109.0);
+        assert_eq!(c.melody.state, State::Ready); // No voice: keep waiting.
+        c.workflow = Workflow::Listening;
+        c.poll_melody(110.0);
+        assert_eq!(c.melody.state, State::Ready);
+        // An ordinary exercise evaluator cannot accidentally score a melody.
+        let voice: Vec<_> = (0..200)
+            .map(|i| Frame {
+                time: i as f64 * 0.01,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 0.99,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            })
+            .collect();
+        assert!(
+            matches!(training::evaluate(&voice,c.config),Result::Unscored(reason) if reason.contains("timeline"))
+        );
+    }
+    #[test]
     fn essential_controls_fit_reference_layout_sizes() {
         for size in [
             [720.0, 720.0],
@@ -1780,6 +2497,162 @@ mod tests {
                 assert!(rect.bottom() <= 640.0 && rect.right() <= 720.0);
             }
         }
+    }
+    #[test]
+    fn active_compact_range_shows_live_voice_and_thumbnail_selects_saved_review() {
+        let mut c = Coach::init(true);
+        c.add_guide(48, None);
+        wait_guides(&mut c);
+        let mut r = Range::new();
+        r.target = Some(48);
+        r.phase = RangePhase::Higher;
+        c.range = Some(r);
+        c.review_singing = true;
+        c.view = View::Compact;
+        c.history.push_back(Frame {
+            time: c.now(),
+            hz: Some(dsp::hz(48.0)),
+            confidence: 0.99,
+            rms: 0.1,
+            clipped: false,
+            spectrum: None,
+        });
+        c.guides[0].voice = vec![Frame {
+            time: 0.0,
+            hz: Some(dsp::hz(50.0)),
+            confidence: 0.99,
+            rms: 0.1,
+            clipped: false,
+            spectrum: None,
+        }];
+        let output = render_frames(&mut c, [960.0, 760.0]);
+        assert!(text_bounds(&output, "Blue = your live voice").is_positive());
+        assert!(text_bounds(&output, "•").is_positive());
+        c.guide = Some(0);
+        let output = render_frames(&mut c, [960.0, 760.0]);
+        assert!(text_bounds(&output, "Blue = captured singing").is_positive());
+        assert!(text_bounds(&output, "1 · D3").is_positive());
+        assert_eq!(c.history.back().unwrap().hz, Some(dsp::hz(48.0)));
+        assert_eq!(c.range.as_ref().unwrap().target, Some(48));
+    }
+    #[test]
+    fn range_review_saves_only_matched_holds_and_hides_empty_prompts() {
+        let mut c = Coach::init(true);
+        c.add_guide(60, None);
+        wait_guides(&mut c);
+        let mut r = Range::new();
+        r.target = Some(60);
+        r.phase = RangePhase::ConfirmStart;
+        c.range = Some(r);
+        c.review_singing = true;
+        c.player.playing = true;
+        c.player.ready = true;
+        c.range_reference_ready_at = Some(10.0);
+        let frame = |time: f64, note: Option<f32>| Frame {
+            time,
+            hz: note.map(dsp::hz),
+            confidence: 0.99,
+            rms: if note.is_some() { 0.1 } else { 0.0 },
+            clipped: false,
+            spectrum: None,
+        };
+        for i in 0..100 {
+            c.observe_range_frame(&frame(11.0 + i as f64 * 0.01, Some(48.0)));
+        }
+        assert!(
+            c.guides[0].voice.is_empty(),
+            "Approach must not enter the saved clip"
+        );
+        let mut matched_at = None;
+        for i in 0..130 {
+            let time = 12.0 + i as f64 * 0.01;
+            c.observe_range_frame(&frame(time, Some(60.0)));
+            if c.range.as_ref().unwrap().holding_match() {
+                matched_at.get_or_insert(time);
+            }
+        }
+        assert!(c.range.as_ref().unwrap().holding_match());
+        assert_eq!(c.guides[0].voice_start, matched_at);
+        for i in 0..1700 {
+            c.observe_range_frame(&frame(13.3 + i as f64 * 0.01, Some(62.0)));
+        }
+        assert_eq!(c.guides[0].voice.len(), 1600);
+        assert_eq!(c.guides[0].voice[0].time, 0.0);
+        assert!(c.guides[0]
+            .voice
+            .iter()
+            .all(|f| dsp::midi(f.hz.unwrap()) >= 59.9));
+        assert_eq!(c.guides[0].review_label(true), "D4");
+        assert_eq!(c.guides[0].review_label(false), "C4");
+        assert!((dsp::midi(c.guides[0].frames[10].hz.unwrap()) - 60.0).abs() < 0.1);
+        c.range = None;
+        c.player.stop();
+        c.add_guide(64, None); // An unanswered prompt must not create a singing entry.
+        wait_guides(&mut c);
+        for view in [View::Compact, View::Full, View::Spectrum] {
+            c.view = view;
+            c.review_singing = true;
+            let output = render_frames(&mut c, [960.0, 760.0]);
+            assert!(text_bounds(&output, "1 · D4").is_positive());
+            if view != View::Spectrum {
+                assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                    egui::epaint::Shape::LineSegment { stroke, .. }
+                    if stroke.color == PURPLE.gamma_multiply(0.65) && stroke.width == 1.5)));
+            }
+
+            assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("No voice"))));
+            c.review_singing = false;
+            let output = render_frames(&mut c, [960.0, 760.0]);
+            assert!(text_bounds(&output, "1 · C4").is_positive());
+            assert!(text_bounds(&output, "2 · E4").is_positive());
+        }
+    }
+    #[test]
+    fn range_release_trims_saved_silence_while_live_history_continues() {
+        let mut c = Coach::init(true);
+        c.add_guide(48, None);
+        let mut r = Range::new();
+        r.target = Some(48);
+        r.phase = RangePhase::ConfirmStart;
+        c.range = Some(r);
+        c.player.playing = true;
+        c.player.ready = true;
+        c.range_reference_ready_at = Some(10.0);
+        c.review_singing = true;
+        c.view = View::Compact;
+        for i in 0..230 {
+            let f = Frame {
+                time: 11.0 + i as f64 * 0.01,
+                hz: Some(dsp::hz(48.0)),
+                confidence: 0.99,
+                rms: 0.1,
+                clipped: false,
+                spectrum: None,
+            };
+            c.history.push_back(f.clone());
+            c.observe_range_frame(&f);
+        }
+        let end = c.history.back().unwrap().time;
+        for i in 0..30 {
+            let f = Frame {
+                time: 13.3 + i as f64 * 0.01,
+                hz: None,
+                confidence: 0.0,
+                rms: 0.0,
+                clipped: false,
+                spectrum: None,
+            };
+            c.history.push_back(f.clone());
+            c.observe_range_frame(&f);
+        }
+        assert!(!c.range.as_ref().unwrap().holding_match());
+        assert!(c.guides[0].voice.last().unwrap().hz.is_some());
+        assert!(c.history.back().unwrap().time > end);
+        let saved = &c.guides[0].voice;
+        let fitted = crate::monitor::overview_pitch(&[saved], 20.0);
+        let pitched: Vec<_> = fitted.iter().filter(|f| f.hz.is_some()).collect();
+        assert!(pitched.last().unwrap().time - pitched[0].time > 2.5);
     }
     #[test]
     fn saved_guide_review_changes_neither_training_nor_voice_history() {
@@ -1882,6 +2755,51 @@ mod tests {
         c.stop_reference();
         assert!(c.feedback.is_some());
         assert_eq!(c.config.target, 52);
+    }
+    #[test]
+    fn range_piano_stops_after_three_runs_and_silent_hold_keeps_tracking() {
+        let mut r = Range::new();
+        let frame = |time: f64, voiced: bool| Frame {
+            time,
+            hz: voiced.then_some(dsp::hz(48.0)),
+            confidence: if voiced { 0.99 } else { 0.0 },
+            rms: if voiced { 0.1 } else { 0.0 },
+            clipped: false,
+            spectrum: None,
+        };
+        for i in 0..60 {
+            r.observe(&frame(i as f64 * 0.01, true), false);
+        }
+        let mut c = Coach::init(true);
+        c.range = Some(r);
+        c.player.playing = true;
+        c.player.ready = true;
+        c.range_reference_ready_at = Some(10.0);
+        for i in 0..130 {
+            c.observe_range_frame(&frame(11.0 + i as f64 * 0.01, true));
+        }
+        assert!(c.range.as_ref().unwrap().holding_match());
+        c.poll_range_reference(15.99);
+        assert!(c.player.playing);
+        c.poll_range_reference(16.0);
+        assert!(!c.player.playing && c.range_piano_finished);
+        let before = c.range.as_ref().unwrap().held_seconds();
+        for i in 130..950 {
+            c.observe_range_frame(&frame(11.0 + i as f64 * 0.01, true));
+        }
+        c.poll_range_reference(20.5);
+        let r = c.range.as_ref().unwrap();
+        assert!(r.holding_match());
+        assert!(r.held_seconds() > before + 8.0);
+        assert!(!c.player.playing);
+        for i in 0..15 {
+            c.observe_range_frame(&frame(20.5 + i as f64 * 0.01, false));
+        }
+        let r = c.range.as_mut().unwrap();
+        assert!(!r.holding_match());
+        assert!(r.resting(20.65));
+        assert_eq!(r.advance(21.8), RangeEvent::ReferenceChanged);
+        assert!(r.highest_sustain.unwrap().1 > 9.0);
     }
     #[test]
     fn queued_voice_from_before_reference_readiness_does_not_count() {
@@ -2117,5 +3035,12 @@ mod tests {
         assert_eq!(c.config.target, 48);
         assert!(c.range.is_none());
         assert!(!c.player.playing);
+        for size in [[960.0, 760.0], [720.0, 640.0]] {
+            let output = render_frames(&mut c, size);
+            assert!(text_bounds(&output, "Suggested practice note: C3").right() <= size[0]);
+            assert!(text_bounds(&output, "Try C3 · target set").bottom() < 220.0);
+            assert!(text_bounds(&output, "Highest sustain: E3").right() <= size[0]);
+            assert_eq!(c.config.target, 48);
+        }
     }
 }

@@ -3,6 +3,7 @@ use crate::dsp::{cents, Frame};
 pub enum Exercise {
     Attack,
     Transition,
+    Melody,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
@@ -73,6 +74,9 @@ fn arrival(f: &[Frame], start: usize, target: i32) -> Option<usize> {
 }
 pub fn evaluate(f: &[Frame], c: Config) -> Result {
     let no = |s: &str| Result::Unscored(s.into());
+    if c.exercise == Exercise::Melody {
+        return no("Melody requires its expected note timeline.");
+    }
     if f.len() < 2 {
         return no("Sing for about one second, then pause.");
     }
